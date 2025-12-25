@@ -28,6 +28,7 @@ If others want to use this storage format, simply copy the `src/ProteinAAStore.h
 
 ## Main Features
 - `build(seqs)` / `add(seq)` / `finalize()`: Build and incremental addition
+-`add(seq)`: When inserting sequences incrementally, pre-reserving enough capacity using `init(size)` for the `int_vector` is strongly recommended to avoid costly `resize()`-induced reallocations.
 - `get(i)`: Return i-th sequence (string)
 - `length(i)`: Return length of i-th sequence
 - `checksum(i)`: Lightweight access (no string allocation) summing encoded values
