@@ -1,3 +1,6 @@
+#ifndef __PROTEIN_AASTORE__
+#define __PROTEIN_AASTORE__
+
 #include <sdsl/int_vector.hpp>
 #include <cstdint>
 #include <stdexcept>
@@ -197,3 +200,5 @@ private:
 
     size_t n_ = 0;
 };
+
+#endif
