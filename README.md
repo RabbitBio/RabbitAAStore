@@ -15,6 +15,7 @@ cmake --build .
 - `-f, --fasta <file>`: Input FASTA file (mutually exclusive with `--load`)
 - `-l, --load <file|dir>`: Load from binary archive; if directory, default filename `protein_store.bin`
 - `-o, --output <file|dir>`: Save built/loaded store; if directory, uses default filename
+- `-L, --min-length <uint>`: Minimum sequence length filter (sequences shorter than this will be skipped, default 0 = no filtering)
 
 ## Storage Format (Reference `ProteinAAStore`)
 - 5-bit encoded sequences: `data_` (`sdsl::int_vector<5>`)

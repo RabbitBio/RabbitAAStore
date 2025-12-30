@@ -32,7 +32,10 @@ int main(int argc, char** argv) {
 
     std::string load_path;
     app.add_option("-l,--load", load_path, "Load serialized store from file or directory (default protein_store.bin)");
-    
+
+    uint64_t min_length = 0;
+    app.add_option("-L,--min-length", min_length, "Minimum sequence length filter (sequences shorter than this will be skipped, default 0 = no filtering)");
+
     CLI11_PARSE(app, argc, argv);
 
     auto resolve_path = [](const std::string& p) -> std::string {
@@ -131,8 +134,15 @@ int main(int argc, char** argv) {
         
         // Read sequences and build store
         auto start_read = std::chrono::high_resolution_clock::now();
+        uint64_t skipped_seqs = 0;
         while (kseq_read(seq) >= 0) {
             if (seq->seq.l > 0) {
+                // Filter sequences shorter than minimum length
+                if (seq->seq.l < min_length) {
+                    skipped_seqs++;
+                    continue;
+                }
+
                 std::string_view seq_view(seq->seq.s, seq->seq.l);
                 store.add(seq_view);
                 total_seq_len += seq->seq.l;
@@ -173,6 +183,12 @@ int main(int argc, char** argv) {
         store.finalize();
         auto end_finalize = std::chrono::high_resolution_clock::now();
         duration_finalize = std::chrono::duration_cast<std::chrono::milliseconds>(end_finalize - start_finalize);
+
+        std::cout << "Read " << num_seqs << " sequences";
+        if (min_length > 0) {
+            std::cout << " (skipped " << skipped_seqs << " sequences shorter than " << min_length << " characters)";
+        }
+        std::cout << std::endl;
 
         // Validate sequence integrity
         if (!validation_samples.empty()) {
