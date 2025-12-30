@@ -8,8 +8,6 @@
 #include <string_view>
 #include <vector>
 #include <tuple>
-#include "kseq.h"
-#include "CLI11.hpp"
 
 class ProteinAAStore {
 public:

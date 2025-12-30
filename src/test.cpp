@@ -1,4 +1,6 @@
 #include "ProteinAAStore.hpp"
+#include "CLI11.hpp"
+#include "kseq.h"
 
 #include <iostream>
 #include <fstream>
@@ -11,7 +13,6 @@
 #include <sys/stat.h>
 #include <filesystem>
 #include <random>
-
 // Helper function for kseq to read from FILE*
 static inline size_t kseq_file_read(FILE* fp, void* buf, size_t size) {
     return fread(buf, 1, size, fp);
