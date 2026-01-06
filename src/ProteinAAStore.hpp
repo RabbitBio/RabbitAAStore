@@ -146,7 +146,19 @@ public:
         }
         return out;
     }
+    size_t get_raw(size_t i, std::vector<uint8_t>& out) {
+        if (i >= n_) throw std::out_of_range("sequence index out of range");
+        
+        uint64_t start_pos = start_positions_[i];
+        uint64_t end_pos = start_positions_[i + 1];
 
+        // decode [start_pos, end_pos)
+        out.resize(end_pos - start_pos);
+        for (uint64_t i = 0; i < end_pos - start_pos; ++i) {
+            out[i] = data_[start_pos + i];
+        }
+        return end_pos - start_pos;
+    }
     // Length of i-th sequence
     uint64_t length(size_t i) {
         if (i >= n_) throw std::out_of_range("sequence index out of range");
