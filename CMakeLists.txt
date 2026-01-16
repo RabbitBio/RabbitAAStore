@@ -12,16 +12,24 @@ endif()
 
 add_compile_options(-O3 -march=native)
 
+# 查找线程库
+find_package(Threads REQUIRED)
 
 add_executable(test src/test.cpp)
+add_executable(kmercount src/kmercount.cpp)
+
+# 链接线程库
+target_link_libraries(kmercount PRIVATE Threads::Threads)
 
 # 如果使用 GCC 8 可能需要显式链接 stdc++fs
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
     target_link_libraries(test PRIVATE stdc++fs)
+    target_link_libraries(kmercount PRIVATE stdc++fs)
   endif()
 endif()
 
 
 # 如果 sdsl 在本仓库相对路径（例如 src/sdsl），可加入包含目录
 target_include_directories(test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(kmercount PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
