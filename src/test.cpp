@@ -39,6 +39,12 @@ int main(int argc, char** argv) {
     std::string names_index_output;
     app.add_option("--names-index-output", names_index_output, "Output file to save name index offsets (uint64_t per line). Default: protein_names.txt.idx next to names file");
 
+    std::string names_load;
+    app.add_option("--names-load", names_load, "Load sequence names file (one per line, without '>'). Optional");
+
+    std::string names_index_load;
+    app.add_option("--names-index-load", names_index_load, "Load name index offsets file (uint64_t per entry). Optional; default is names file + .idx");
+
     uint64_t min_length = 0;
     app.add_option("-L,--min-length", min_length, "Minimum sequence length filter (sequences shorter than this will be skipped, default 0 = no filtering)");
 
@@ -58,6 +64,7 @@ int main(int argc, char** argv) {
     uint64_t num_seqs = 0;
     std::chrono::milliseconds duration_read{0};
     std::chrono::milliseconds duration_finalize{0};
+    std::chrono::milliseconds duration_names_load{0};
 
     // For sequence validation
     std::vector<std::pair<size_t, std::string>> validation_samples;
@@ -80,6 +87,30 @@ int main(int argc, char** argv) {
         std::cout << "Loaded " << num_seqs << " sequences in "
                   << std::chrono::duration_cast<std::chrono::milliseconds>(end_load - start_load).count()
                   << " ms" << std::endl;
+
+        if (!names_load.empty() || !names_index_load.empty()) {
+            std::string names_load_path = names_load;
+            if (names_load_path.empty()) {
+                const std::string suffix = ".idx";
+                if (names_index_load.size() >= suffix.size() &&
+                    names_index_load.rfind(suffix) == names_index_load.size() - suffix.size()) {
+                    names_load_path = names_index_load.substr(0, names_index_load.size() - suffix.size());
+                } else {
+                    std::cerr << "Error: --names-load is required when --names-index-load is not a .idx file" << std::endl;
+                    return 1;
+                }
+            }
+            std::string names_index_load_path = names_index_load;
+            auto start_names_load = std::chrono::high_resolution_clock::now();
+            if (!store.load_names(names_load_path, names_index_load_path)) {
+                std::cerr << "Error: failed to load names from " << names_load_path << std::endl;
+                return 1;
+            }
+            auto end_names_load = std::chrono::high_resolution_clock::now();
+            duration_names_load = std::chrono::duration_cast<std::chrono::milliseconds>(end_names_load - start_names_load);
+            std::cout << "Loaded names from " << names_load_path << " in "
+                      << duration_names_load.count() << " ms" << std::endl;
+        }
     } else {
         // Require fasta if not loading
         if (fasta_file.empty()) {
@@ -108,18 +139,6 @@ int main(int argc, char** argv) {
             names_index_path = names_index_output;
         } else {
             names_index_path = names_path + ".idx";
-        }
-        std::ofstream names_out(names_path);
-        if (!names_out) {
-            std::cerr << "Error: Cannot open names output file " << names_path << std::endl;
-            std::fclose(fp);
-            return 1;
-        }
-        std::ofstream names_index_out(names_index_path, std::ios::binary);
-        if (!names_index_out) {
-            std::cerr << "Error: Cannot open names index output file " << names_index_path << std::endl;
-            std::fclose(fp);
-            return 1;
         }
         std::cout << "Writing sequence names to " << names_path << "..." << std::endl;
         std::cout << "Writing name index to " << names_index_path << "..." << std::endl;
@@ -181,11 +200,7 @@ int main(int argc, char** argv) {
                 }
 
                 std::string_view seq_view(seq->seq.s, seq->seq.l);
-                std::streampos pos = names_out.tellp();
-                uint64_t offset = pos < 0 ? 0 : static_cast<uint64_t>(pos);
-                names_index_out.write(reinterpret_cast<const char*>(&offset), sizeof(uint64_t));
-                names_out << seq->name.s << "\n";
-                store.add(seq_view);
+                store.add(seq_view, seq->name.s);
                 total_seq_len += seq->seq.l;
 
                 // Sample some sequences for validation (sample rate: ~0.1% or at least 10 samples)
@@ -230,6 +245,13 @@ int main(int argc, char** argv) {
             std::cout << " (skipped " << skipped_seqs << " sequences shorter than " << min_length << " characters)";
         }
         std::cout << std::endl;
+
+        // Save names and name index
+        if (!store.save_names(names_path, names_index_path)) {
+            std::cerr << "Error: failed to save names to " << names_path
+                      << " (index: " << names_index_path << ")" << std::endl;
+            return 1;
+        }
 
         // Validate sequence integrity
         if (!validation_samples.empty()) {
@@ -299,6 +321,10 @@ int main(int argc, char** argv) {
     std::cout << "Number of sequences: " << store.size() << std::endl;
     std::cout << "Total sequence length: " << total_seq_len << " characters" << std::endl;
     std::cout << "Average sequence length: " << (num_seqs > 0 ? total_seq_len / num_seqs : 0) << " characters" << std::endl;
+    if (store.has_names() && store.size() > 0) {
+        std::cout << "First name: " << store.name(0) << std::endl;
+        std::cout << "Last name: " << store.name(store.size() - 1) << std::endl;
+    }
     std::cout << "\n=== Memory Usage ===" << std::endl;
     std::cout << "Total memory: " << mem_bytes << " bytes";
     if (mem_kb > 0) {
@@ -345,6 +371,10 @@ int main(int argc, char** argv) {
               << duration_read.count() / 1000.0 << " s)" << std::endl;
     std::cout << "Finalizing: " << duration_finalize.count() << " ms ("
               << duration_finalize.count() / 1000.0 << " s)" << std::endl;
+    if (duration_names_load.count() > 0) {
+        std::cout << "Loading names/index: " << duration_names_load.count() << " ms ("
+                  << duration_names_load.count() / 1000.0 << " s)" << std::endl;
+    }
     std::cout << "Memory calculation: " << duration_mem.count() << " ms ("
               << duration_mem.count() / 1000.0 << " s)" << std::endl;
     std::cout << "Total time: " << duration_total.count() << " ms ("
