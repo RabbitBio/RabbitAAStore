@@ -4,7 +4,6 @@
 
 #include <iostream>
 #include <fstream>
-#include <sstream>
 #include <cstdio>
 #include <chrono>
 #include <iomanip>
@@ -33,6 +32,12 @@ int main(int argc, char** argv) {
 
     std::string load_path;
     app.add_option("-l,--load", load_path, "Load serialized store from file or directory (default protein_store.bin)");
+
+    std::string names_output;
+    app.add_option("-n,--names-output", names_output, "Output file to save sequence names (one per line, without '>'). Default: protein_names.txt next to output store or in current directory");
+
+    std::string names_index_output;
+    app.add_option("--names-index-output", names_index_output, "Output file to save name index offsets (uint64_t per line). Default: protein_names.txt.idx next to names file");
 
     uint64_t min_length = 0;
     app.add_option("-L,--min-length", min_length, "Minimum sequence length filter (sequences shorter than this will be skipped, default 0 = no filtering)");
@@ -87,6 +92,37 @@ int main(int argc, char** argv) {
             std::cerr << "Error: Cannot open file " << fasta_file << std::endl;
             return 1;
         }
+
+        std::string names_path;
+        if (!names_output.empty()) {
+            names_path = names_output;
+        } else if (!save_path.empty()) {
+            namespace fs = std::filesystem;
+            fs::path store_path(resolve_path(save_path));
+            names_path = (store_path.parent_path() / "protein_names.txt").string();
+        } else {
+            names_path = "protein_names.txt";
+        }
+        std::string names_index_path;
+        if (!names_index_output.empty()) {
+            names_index_path = names_index_output;
+        } else {
+            names_index_path = names_path + ".idx";
+        }
+        std::ofstream names_out(names_path);
+        if (!names_out) {
+            std::cerr << "Error: Cannot open names output file " << names_path << std::endl;
+            std::fclose(fp);
+            return 1;
+        }
+        std::ofstream names_index_out(names_index_path, std::ios::binary);
+        if (!names_index_out) {
+            std::cerr << "Error: Cannot open names index output file " << names_index_path << std::endl;
+            std::fclose(fp);
+            return 1;
+        }
+        std::cout << "Writing sequence names to " << names_path << "..." << std::endl;
+        std::cout << "Writing name index to " << names_index_path << "..." << std::endl;
         
         kseq_t* seq = kseq_init(fp);
         if (!seq) {
@@ -145,6 +181,10 @@ int main(int argc, char** argv) {
                 }
 
                 std::string_view seq_view(seq->seq.s, seq->seq.l);
+                std::streampos pos = names_out.tellp();
+                uint64_t offset = pos < 0 ? 0 : static_cast<uint64_t>(pos);
+                names_index_out.write(reinterpret_cast<const char*>(&offset), sizeof(uint64_t));
+                names_out << seq->name.s << "\n";
                 store.add(seq_view);
                 total_seq_len += seq->seq.l;
 
