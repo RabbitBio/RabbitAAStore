@@ -14,12 +14,17 @@ add_compile_options(-O3 -march=native)
 
 # 查找线程库
 find_package(Threads REQUIRED)
+find_package(OpenMP)
 
 add_executable(test src/test.cpp)
 add_executable(kmercount src/kmercount.cpp)
 
 # 链接线程库
 target_link_libraries(kmercount PRIVATE Threads::Threads)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(test PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(kmercount PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # 如果使用 GCC 8 可能需要显式链接 stdc++fs
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

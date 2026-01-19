@@ -18,6 +18,7 @@
 #include <sys/sysinfo.h>
 #endif
 
+#include "omp.h"
 // k-mer 最大支持 k=12 (5*12=60 bits < 64 bits)
 constexpr int MAX_K = 12;
 constexpr int BITS_PER_AA = 5;
@@ -476,12 +477,17 @@ public:
         
         uint64_t prefix_shift = suffix_bits_;
         uint64_t target_prefix = partition_id;
-        
-        auto worker = [&](size_t start_idx, size_t end_idx) {
+        std::cerr << "Start OMP region" << std::endl;
+
+        #pragma omp parallel num_threads(num_threads_)
+        {
             std::vector<uint8_t> seq_raw;
             uint64_t local_kmers = 0;
-            
-            for (size_t i = start_idx; i < end_idx; ++i) {
+            uint64_t local_seqs = 0;
+
+            #pragma omp for schedule(guided)
+            for (size_t i = 0; i < total_seqs; ++i) {
+                ++local_seqs;
                 size_t seq_len = store.get_raw(i, seq_raw);
                 if (seq_len < static_cast<size_t>(k_)) continue;
                 
@@ -514,36 +520,44 @@ public:
                     }
                 }
             }
-            
-            partition_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
-            sequences_processed_.fetch_add(end_idx - start_idx, std::memory_order_relaxed);
-        };
-        
-        std::vector<std::thread> threads;
-        size_t chunk_size = (total_seqs + num_threads_ - 1) / num_threads_;
-        
-        for (int t = 0; t < num_threads_; ++t) {
-            size_t start = t * chunk_size;
-            size_t end = std::min(start + chunk_size, total_seqs);
-            if (start < end) {
-                threads.emplace_back(worker, start, end);
+
+            if (local_kmers > 0) {
+                partition_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            }
+            if (local_seqs > 0) {
+                sequences_processed_.fetch_add(local_seqs, std::memory_order_relaxed);
             }
         }
-        
-        for (auto& th : threads) th.join();
         
         total_kmers_processed_.fetch_add(partition_kmers.load(), std::memory_order_relaxed);
         
         // 提取高频 k-mer
         uint64_t high_freq_count = 0;
-        for (uint64_t i = 0; i < partition_size_; ++i) {
-            uint32_t cnt = counts[i].load(std::memory_order_relaxed);
-            if (cnt >= min_count_) {
-                uint64_t kmer = (partition_id << prefix_shift) | i;
-                high_freq_kmers_.emplace_back(kmer, cnt);
-                ++high_freq_count;
+        #pragma omp parallel num_threads(num_threads_) reduction(+:high_freq_count)
+        {
+            std::vector<std::pair<uint64_t, uint64_t>> local_kmers;
+            uint64_t local_count = 0;
+
+            #pragma omp for schedule(static)
+            for (uint64_t i = 0; i < partition_size_; ++i) {
+                uint32_t cnt = counts[i].load(std::memory_order_relaxed);
+                if (cnt >= min_count_) {
+                    uint64_t kmer = (partition_id << prefix_shift) | i;
+                    local_kmers.emplace_back(kmer, cnt);
+                    ++local_count;
+                }
+                counts[i].store(0, std::memory_order_relaxed);  // 重置供下一分区使用
             }
-            counts[i].store(0, std::memory_order_relaxed);  // 重置供下一分区使用
+
+            if (!local_kmers.empty()) {
+                #pragma omp critical
+                {
+                    high_freq_kmers_.insert(high_freq_kmers_.end(),
+                                            local_kmers.begin(),
+                                            local_kmers.end());
+                }
+            }
+            high_freq_count += local_count;
         }
         
         std::cerr << "  分区 " << (partition_id + 1) << "/" << num_partitions_ 
@@ -555,11 +569,33 @@ public:
         std::cerr << "开始 MULTIPASS_ARRAY 模式 k-mer 统计 (共 " << num_partitions_ 
                   << " 轮, " << num_threads_ << " 线程)...\n";
         auto t_start = std::chrono::high_resolution_clock::now();
+        auto t_init_begin = t_start;
         
         // 预分配原子计数数组（复用）
+        auto t_counts_alloc_begin = std::chrono::high_resolution_clock::now();
         std::vector<std::atomic<uint32_t>> counts(partition_size_);
-        for (auto& c : counts) c.store(0, std::memory_order_relaxed);
+        auto t_counts_alloc_end = std::chrono::high_resolution_clock::now();
+        auto t_counts_zero_begin = t_counts_alloc_end;
+        #pragma omp parallel for num_threads(num_threads_) schedule(static)
+        for (uint64_t i = 0; i < partition_size_; ++i) {
+            counts[i].store(0, std::memory_order_relaxed);
+        }
+        auto t_counts_zero_end = std::chrono::high_resolution_clock::now();
+        auto t_init_end = t_counts_zero_end;
         
+        std::cerr << "初始化耗时统计:\n";
+        std::cerr << "  counts 分配: "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(t_counts_alloc_end - t_counts_alloc_begin).count()
+                  << " ms\n";
+        std::cerr << "  counts 清零: "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(t_counts_zero_end - t_counts_zero_begin).count()
+                  << " ms\n";
+        std::cerr << "  初始化总计: "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(t_init_end - t_init_begin).count()
+                  << " ms\n";
+
+        std::cerr << "Start process_partition_mt" << std::endl;
+
         for (uint64_t p = 0; p < num_partitions_; ++p) {
             process_partition_mt(store, p, counts);
         }
