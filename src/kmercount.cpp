@@ -67,18 +67,29 @@ const char* storage_mode_name(StorageMode mode) {
     return "UNKNOWN";
 }
 
-// X/x 的 5-bit 编码值 ('X' & 0x1F = 24)
-constexpr uint8_t AA_CODE_X = 24;
+// 非标准/稀有氨基酸的 5-bit 编码值 (char & 0x1F)
+constexpr uint8_t AA_CODE_X = 24;  // 'X' & 0x1F = 24
+constexpr uint8_t AA_CODE_B = 2;   // 'B' & 0x1F = 2  (Asx: Asp 或 Asn)
+constexpr uint8_t AA_CODE_Z = 26;  // 'Z' & 0x1F = 26 (Glx: Glu 或 Gln)
+constexpr uint8_t AA_CODE_J = 10;  // 'J' & 0x1F = 10 (Xle: Leu 或 Ile)
+constexpr uint8_t AA_CODE_U = 21;  // 'U' & 0x1F = 21 (Sec: 硒代半胱氨酸)
+constexpr uint8_t AA_CODE_O = 15;  // 'O' & 0x1F = 15 (Pyl: 吡咯赖氨酸)
 
-// 检查氨基酸编码是否有效（不是 X）
-inline bool is_valid_aa(uint8_t aa_code) {
-    return aa_code != AA_CODE_X;
+// 检查氨基酸编码是否为无效/非标准（X, B, Z, J, U, O）
+inline bool is_invalid_aa(uint8_t aa_code) {
+    return aa_code == AA_CODE_X || aa_code == AA_CODE_B || aa_code == AA_CODE_Z ||
+           aa_code == AA_CODE_J || aa_code == AA_CODE_U || aa_code == AA_CODE_O;
 }
 
-// 检查序列片段是否包含 X
-inline bool contains_x(const std::vector<uint8_t>& seq, size_t start, int k) {
+// 检查氨基酸编码是否有效（不是 X, B, Z, J, U, O）
+inline bool is_valid_aa(uint8_t aa_code) {
+    return !is_invalid_aa(aa_code);
+}
+
+// 检查序列片段是否包含无效氨基酸
+inline bool contains_invalid_aa(const std::vector<uint8_t>& seq, size_t start, int k) {
     for (int i = 0; i < k; ++i) {
-        if (seq[start + i] == AA_CODE_X) return true;
+        if (is_invalid_aa(seq[start + i])) return true;
     }
     return false;
 }
@@ -260,7 +271,7 @@ public:
                 // 跟踪当前窗口中 X 的数量
                 int x_count = 0;
                 for (int p = 0; p < k_; ++p) {
-                    if (seq_raw[p] == AA_CODE_X) ++x_count;
+                    if (is_invalid_aa(seq_raw[p])) ++x_count;
                 }
                 
                 // 第一个 k-mer
@@ -274,8 +285,8 @@ public:
                 uint64_t kmer = encode_kmer(seq_raw, 0, k_);
                 for (size_t j = 1; j <= seq_len - k_; ++j) {
                     // 更新 X 计数：移出旧字符，移入新字符
-                    if (seq_raw[j - 1] == AA_CODE_X) --x_count;
-                    if (seq_raw[j + k_ - 1] == AA_CODE_X) ++x_count;
+                    if (is_invalid_aa(seq_raw[j - 1])) --x_count;
+                    if (is_invalid_aa(seq_raw[j + k_ - 1])) ++x_count;
                     
                     kmer = slide_kmer(kmer, seq_raw[j + k_ - 1], kmer_mask_);
                     
@@ -363,7 +374,7 @@ public:
                 // 跟踪当前窗口中 X 的数量
                 int x_count = 0;
                 for (int p = 0; p < k_; ++p) {
-                    if (seq_raw[p] == AA_CODE_X) ++x_count;
+                    if (is_invalid_aa(seq_raw[p])) ++x_count;
                 }
                 
                 uint64_t kmer = encode_kmer(seq_raw, 0, k_);
@@ -374,8 +385,8 @@ public:
                 }
                 
                 for (size_t j = 1; j <= seq_len - k_; ++j) {
-                    if (seq_raw[j - 1] == AA_CODE_X) --x_count;
-                    if (seq_raw[j + k_ - 1] == AA_CODE_X) ++x_count;
+                    if (is_invalid_aa(seq_raw[j - 1])) --x_count;
+                    if (is_invalid_aa(seq_raw[j + k_ - 1])) ++x_count;
                     
                     kmer = slide_kmer(kmer, seq_raw[j + k_ - 1], kmer_mask_);
                     
@@ -494,7 +505,7 @@ public:
                 // 跟踪当前窗口中 X 的数量
                 int x_count = 0;
                 for (int p = 0; p < k_; ++p) {
-                    if (seq_raw[p] == AA_CODE_X) ++x_count;
+                    if (is_invalid_aa(seq_raw[p])) ++x_count;
                 }
                 
                 uint64_t kmer = encode_kmer(seq_raw, 0, k_);
@@ -507,8 +518,8 @@ public:
                 }
                 
                 for (size_t j = 1; j <= seq_len - k_; ++j) {
-                    if (seq_raw[j - 1] == AA_CODE_X) --x_count;
-                    if (seq_raw[j + k_ - 1] == AA_CODE_X) ++x_count;
+                    if (is_invalid_aa(seq_raw[j - 1])) --x_count;
+                    if (is_invalid_aa(seq_raw[j + k_ - 1])) ++x_count;
                     
                     kmer = slide_kmer(kmer, seq_raw[j + k_ - 1], kmer_mask_);
                     prefix = kmer >> prefix_shift;
