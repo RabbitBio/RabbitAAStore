@@ -9,6 +9,7 @@
 #include <vector>
 #include <tuple>
 #include <fstream>
+#include <cstring>
 
 class ProteinAAStore {
 public:
@@ -71,7 +72,7 @@ public:
             data_[p++] = enc(c);
         }
 
-        names_.emplace_back("");
+        add_name("");
         ++n_;
     }
 
@@ -92,26 +93,46 @@ public:
             data_[p++] = enc(c);
         }
 
-        names_.emplace_back(name);
+        add_name(name);
         ++n_;
     }
 
     // Save names and name index (uint64_t offsets) to separate files.
     // Returns false if names are missing or file I/O fails.
-    bool save_names(const std::string& names_path, const std::string& index_path = "") const {
-        if (names_.empty() || names_.size() != n_) return false;
+    // If keep_names is true, names_ will be restored after saving; otherwise it remains modified.
+    bool save_names(const std::string& names_path, const std::string& index_path = "", bool keep_names = true) {
+        if (name_idx_.empty() || name_idx_.size() != n_) return false;
         std::string idx_path = index_path.empty() ? (names_path + ".idx") : index_path;
 
-        std::ofstream names_out(names_path, std::ios::binary);
-        if (!names_out) return false;
+        // Write index file directly
         std::ofstream index_out(idx_path, std::ios::binary);
         if (!index_out) return false;
+        index_out.write(reinterpret_cast<const char*>(name_idx_.data()),
+                        static_cast<std::streamsize>(name_idx_.size() * sizeof(uint64_t)));
 
-        for (const auto& name : names_) {
-            std::streampos pos = names_out.tellp();
-            uint64_t offset = pos < 0 ? 0 : static_cast<uint64_t>(pos);
-            index_out.write(reinterpret_cast<const char*>(&offset), sizeof(uint64_t));
-            names_out << name << "\n";
+        // Replace '\0' with '\n' for human readability
+        for (char& c : names_) {
+            if (c == '\0') c = '\n';
+        }
+
+        // Write names file directly
+        std::ofstream names_out(names_path, std::ios::binary);
+        if (!names_out) {
+            // Restore '\0' on failure if needed
+            if (keep_names) {
+                for (char& c : names_) {
+                    if (c == '\n') c = '\0';
+                }
+            }
+            return false;
+        }
+        names_out.write(names_.data(), static_cast<std::streamsize>(names_.size()));
+
+        // Restore '\0' if names_ will be used later
+        if (keep_names) {
+            for (char& c : names_) {
+                if (c == '\n') c = '\0';
+            }
         }
         return true;
     }
@@ -121,6 +142,7 @@ public:
     bool load_names(const std::string& names_path, const std::string& index_path = "") {
         std::string idx_path = index_path.empty() ? (names_path + ".idx") : index_path;
 
+        // Read index file
         std::ifstream index_in(idx_path, std::ios::binary | std::ios::ate);
         if (!index_in) return false;
         std::streamsize idx_size = index_in.tellg();
@@ -128,25 +150,32 @@ public:
         size_t count = static_cast<size_t>(idx_size / sizeof(uint64_t));
         index_in.seekg(0);
 
-        std::vector<uint64_t> offsets(count);
+        if (n_ != 0 && count != n_) return false;
+
+        name_idx_.resize(count);
         if (count > 0) {
-            index_in.read(reinterpret_cast<char*>(offsets.data()), idx_size);
+            index_in.read(reinterpret_cast<char*>(name_idx_.data()), idx_size);
             if (!index_in) return false;
         }
 
-        if (n_ != 0 && count != n_) return false;
-
-        std::ifstream names_in(names_path, std::ios::binary);
+        // Read names file directly into buffer
+        std::ifstream names_in(names_path, std::ios::binary | std::ios::ate);
         if (!names_in) return false;
+        std::streamsize names_size = names_in.tellg();
+        if (names_size < 0) return false;
+        names_in.seekg(0);
 
-        names_.clear();
-        names_.resize(count);
-        for (size_t i = 0; i < count; ++i) {
-            names_in.seekg(static_cast<std::streamoff>(offsets[i]));
+        names_.resize(static_cast<size_t>(names_size));
+        if (names_size > 0) {
+            names_in.read(names_.data(), names_size);
             if (!names_in) return false;
-            std::string line;
-            if (!std::getline(names_in, line)) return false;
-            names_[i] = std::move(line);
+            // Replace '\n' with '\0' for null-terminated strings
+            for (char& c : names_) {
+                if (c == '\n') c = '\0';
+            }
+        }
+        if (names_.empty() || names_.back() != '\0') {
+            names_.push_back('\0');
         }
         return true;
     }
@@ -283,20 +312,27 @@ public:
     }
 
     bool has_names() const {
-        return !names_.empty() && names_.size() == n_;
+        return !name_idx_.empty() && name_idx_.size() == n_;
     }
 
-    const std::string& name(size_t i) const {
-        if (i >= names_.size()) throw std::out_of_range("name index out of range");
-        return names_[i];
+    const char* name(size_t i) const {
+        if (i >= name_idx_.size()) throw std::out_of_range("name index out of range");
+        return names_.data() + name_idx_[i];
     }
 
 private:
     sdsl::int_vector<5> data_;                 // 5-bit packed codes
     std::vector<uint64_t> start_positions_;    // start position of each sequence
-    std::vector<std::string> names_;           // sequence names (optional)
+    std::vector<char> names_;                  // sequence names (null-terminated)
+    std::vector<uint64_t> name_idx_;           // start offsets for names_
 
     size_t n_ = 0;
+
+    void add_name(std::string_view name) {
+        name_idx_.push_back(static_cast<uint64_t>(names_.size()));
+        names_.insert(names_.end(), name.begin(), name.end());
+        names_.push_back('\0');
+    }
 };
 
 #endif
