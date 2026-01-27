@@ -297,6 +297,14 @@ public:
         return total;
     }
 
+    // Memory usage of names buffer and index (bytes)
+    uint64_t names_memory_usage() const {
+        uint64_t total = 0;
+        total += names_.capacity() * sizeof(char);
+        total += name_idx_.capacity() * sizeof(uint64_t);
+        return total;
+    }
+
     // Get memory breakdown: returns {data_size, positions_size, unused}
     std::tuple<uint64_t, uint64_t, uint64_t> memory_breakdown() const {
         // Actual memory allocated: number of 64-bit words * 8 bytes

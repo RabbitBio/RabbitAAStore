@@ -18,6 +18,7 @@ find_package(OpenMP)
 
 add_executable(aatools src/AAStoreTools.cpp)
 add_executable(kmercount src/kmercount.cpp)
+add_executable(benchmark src/benchmark.cpp)
 
 # 链接线程库
 target_link_libraries(kmercount PRIVATE Threads::Threads)
@@ -38,3 +39,4 @@ endif()
 # 如果 sdsl 在本仓库相对路径（例如 src/sdsl），可加入包含目录
 target_include_directories(aatools PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_include_directories(kmercount PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
