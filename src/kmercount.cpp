@@ -1,5 +1,6 @@
 #include "ProteinAAStore.hpp"
 #include "CLI11.hpp"
+#include "parallel_hashmap/phmap.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -9,7 +10,6 @@
 #include <cmath>
 #include <numeric>
 #include <iomanip>
-#include <unordered_map>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -347,27 +347,49 @@ public:
                   << " 秒\n";
     }
     
-    // ==================== HASHMAP 模式（多线程，每线程局部map后合并）====================
+    // ==================== HASHMAP 模式（使用 parallel_flat_hash_map 实现线程安全）====================
     void run_hashmap_mode(ProteinAAStore& store) {
-        std::cerr << "开始 HASHMAP 模式 k-mer 统计 (" << num_threads_ << " 线程)...\n";
+        std::cerr << "开始 HASHMAP 模式 k-mer 统计 (" << num_threads_ << " 线程, parallel_hashmap)...\n";
         auto t_start = std::chrono::high_resolution_clock::now();
         
         size_t total_seqs = store.size();
         sequences_processed_.store(0);
         total_kmers_processed_.store(0);
         
-        // 每个线程的局部 hashmap
-        std::vector<std::unordered_map<uint64_t, uint32_t>> thread_maps(num_threads_);
+        // 使用 parallel_flat_hash_map 替代多个 unordered_map
+        // N=6 表示 2^6=64 个子表, 使用 std::mutex 实现线程安全
+        using KmerMap = phmap::parallel_flat_hash_map<
+            uint64_t, uint32_t,
+            phmap::priv::hash_default_hash<uint64_t>,
+            phmap::priv::hash_default_eq<uint64_t>,
+            phmap::priv::Allocator<phmap::priv::Pair<const uint64_t, uint32_t>>,
+            6,  // 2^6 = 64 个子表，提高并发性能
+            std::mutex
+        >;
+        
+        KmerMap kmer_map;
+        // 预估 k-mer 数量并预留空间
+        uint64_t estimated_kmers = std::min(store.total_length(), (uint64_t)1ULL << (k_ * BITS_PER_AA));
+        kmer_map.reserve(estimated_kmers / 10);  // 保守估计
         
         // 工作线程函数
-        auto worker = [&](int thread_id, size_t start_idx, size_t end_idx) {
-            auto& local_map = thread_maps[thread_id];
-            local_map.reserve((end_idx - start_idx) * 100);  // 预估每条序列 100 个 kmer
-            
+        auto worker = [&](size_t start_idx, size_t end_idx) {
             std::vector<uint8_t> seq_raw;
             uint64_t local_kmers = 0;
+            uint64_t local_seqs = 0;
+            constexpr uint64_t UPDATE_INTERVAL = 10000;  // 每处理 10000 条序列更新一次进度
             
             for (size_t i = start_idx; i < end_idx; ++i) {
+                ++local_seqs;
+                
+                // 定期更新进度计数器
+                if (local_seqs >= UPDATE_INTERVAL) {
+                    sequences_processed_.fetch_add(local_seqs, std::memory_order_relaxed);
+                    total_kmers_processed_.fetch_add(local_kmers, std::memory_order_relaxed);
+                    local_seqs = 0;
+                    local_kmers = 0;
+                }
+                
                 size_t seq_len = store.get_raw(i, seq_raw);
                 if (seq_len < static_cast<size_t>(k_)) continue;
                 
@@ -379,8 +401,11 @@ public:
                 
                 uint64_t kmer = encode_kmer(seq_raw, 0, k_);
                 if (x_count == 0) {
-                    auto& cnt = local_map[kmer];
-                    if (cnt < UINT32_MAX) ++cnt;
+                    // try_emplace_l: 如果 key 存在则调用 lambda 修改，否则插入默认值
+                    // lambda 参数是 value_type& 即 pair<const K, V>&
+                    kmer_map.try_emplace_l(kmer,
+                        [](auto& kv) { if (kv.second < UINT32_MAX) ++kv.second; },  // key 存在时 +1
+                        1);  // key 不存在时插入 1
                     ++local_kmers;
                 }
                 
@@ -391,15 +416,21 @@ public:
                     kmer = slide_kmer(kmer, seq_raw[j + k_ - 1], kmer_mask_);
                     
                     if (x_count == 0) {
-                        auto& cnt2 = local_map[kmer];
-                        if (cnt2 < UINT32_MAX) ++cnt2;
+                        kmer_map.try_emplace_l(kmer,
+                            [](auto& kv) { if (kv.second < UINT32_MAX) ++kv.second; },
+                            1);
                         ++local_kmers;
                     }
                 }
             }
             
-            total_kmers_processed_.fetch_add(local_kmers, std::memory_order_relaxed);
-            sequences_processed_.fetch_add(end_idx - start_idx, std::memory_order_relaxed);
+            // 最终汇总剩余的计数
+            if (local_seqs > 0) {
+                sequences_processed_.fetch_add(local_seqs, std::memory_order_relaxed);
+            }
+            if (local_kmers > 0) {
+                total_kmers_processed_.fetch_add(local_kmers, std::memory_order_relaxed);
+            }
         };
         
         // 启动进度报告线程
@@ -409,7 +440,8 @@ public:
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 if (!done.load()) {
                     std::cerr << "  进度: " << sequences_processed_.load() << "/" << total_seqs 
-                              << " 序列, " << total_kmers_processed_.load() << " k-mers\n";
+                              << " 序列, " << total_kmers_processed_.load() << " k-mers"
+                              << ", 不同 k-mer: " << kmer_map.size() << "\n";
                 }
             }
         });
@@ -422,7 +454,7 @@ public:
             size_t start = t * chunk_size;
             size_t end = std::min(start + chunk_size, total_seqs);
             if (start < end) {
-                threads.emplace_back(worker, t, start, end);
+                threads.emplace_back(worker, start, end);
             }
         }
         
@@ -431,41 +463,12 @@ public:
         done.store(true);
         progress_thread.join();
         
-        // 合并所有线程的 hashmap
-        std::cerr << "合并 " << num_threads_ << " 个线程的结果...\n";
-        auto t_merge_start = std::chrono::high_resolution_clock::now();
+        std::cerr << "统计完成, 不同 k-mer 数: " << kmer_map.size() << "\n";
         
-        // 找到最大的 map 作为基础
-        size_t max_idx = 0;
-        size_t max_size = 0;
-        for (int t = 0; t < num_threads_; ++t) {
-            if (thread_maps[t].size() > max_size) {
-                max_size = thread_maps[t].size();
-                max_idx = t;
-            }
-        }
-        
-        auto& merged_map = thread_maps[max_idx];
-        
-        // 合并其他 map 到最大的 map
-        for (int t = 0; t < num_threads_; ++t) {
-            if (t == static_cast<int>(max_idx)) continue;
-            for (auto& kv : thread_maps[t]) {
-                auto& cnt = merged_map[kv.first];
-                uint64_t new_cnt = static_cast<uint64_t>(cnt) + kv.second;
-                cnt = (new_cnt > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(new_cnt);
-            }
-            thread_maps[t].clear();  // 释放内存
-        }
-        
-        auto t_merge_end = std::chrono::high_resolution_clock::now();
-        std::cerr << "合并完成, 不同 k-mer 数: " << merged_map.size() 
-                  << ", 耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(t_merge_end - t_merge_start).count()
-                  << " ms\n";
-        
-        // 提取高频 k-mer
-        high_freq_kmers_.reserve(merged_map.size() / 10);
-        for (const auto& kv : merged_map) {
+        // 提取高频 k-mer (无需合并，直接从 parallel_hashmap 提取)
+        std::cerr << "提取高频 k-mer...\n";
+        high_freq_kmers_.reserve(kmer_map.size() / 10);
+        for (const auto& kv : kmer_map) {
             if (kv.second >= min_count_) {
                 high_freq_kmers_.emplace_back(kv.first, kv.second);
             }
@@ -481,14 +484,26 @@ public:
     
     // ==================== MULTIPASS_ARRAY 模式（多线程）====================
     void process_partition_mt(ProteinAAStore& store, uint64_t partition_id,
-                              std::vector<std::atomic<uint32_t>>& counts) {
+                              std::vector<std::atomic<uint32_t>>& counts,
+                              std::atomic<bool>& progress_done) {
         size_t total_seqs = store.size();
         sequences_processed_.store(0);
         std::atomic<uint64_t> partition_kmers{0};
         
         uint64_t prefix_shift = suffix_bits_;
         uint64_t target_prefix = partition_id;
-        std::cerr << "Start OMP region" << std::endl;
+
+        // 启动该分区的进度报告线程
+        std::thread progress_thread([&]() {
+            while (!progress_done.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (!progress_done.load()) {
+                    std::cerr << "  [分区 " << (partition_id + 1) << "/" << num_partitions_ 
+                              << "] 进度: " << sequences_processed_.load() << "/" << total_seqs 
+                              << " 序列, 当前分区 k-mers: " << partition_kmers.load() << "\n";
+                }
+            }
+        });
 
         #pragma omp parallel num_threads(num_threads_)
         {
@@ -499,6 +514,16 @@ public:
             #pragma omp for schedule(guided)
             for (size_t i = 0; i < total_seqs; ++i) {
                 ++local_seqs;
+                // 每处理一定数量的序列就更新一次进度
+                if ((local_seqs & 0xFFFF) == 0) {  // 每 65536 条序列更新一次
+                    sequences_processed_.fetch_add(0x10000, std::memory_order_relaxed);
+                    if (local_kmers > 0) {
+                        partition_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+                        local_kmers = 0;
+                    }
+                    local_seqs = local_seqs & 0xFFFF;  // 保留低16位
+                }
+                
                 size_t seq_len = store.get_raw(i, seq_raw);
                 if (seq_len < static_cast<size_t>(k_)) continue;
                 
@@ -532,6 +557,7 @@ public:
                 }
             }
 
+            // 最终汇总
             if (local_kmers > 0) {
                 partition_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
             }
@@ -540,13 +566,17 @@ public:
             }
         }
         
+        // 停止进度报告线程
+        progress_done.store(true);
+        progress_thread.join();
+        
         total_kmers_processed_.fetch_add(partition_kmers.load(), std::memory_order_relaxed);
         
         // 提取高频 k-mer
         uint64_t high_freq_count = 0;
         #pragma omp parallel num_threads(num_threads_) reduction(+:high_freq_count)
         {
-            std::vector<std::pair<uint64_t, uint64_t>> local_kmers;
+            std::vector<std::pair<uint64_t, uint64_t>> local_high_freq;
             uint64_t local_count = 0;
 
             #pragma omp for schedule(static)
@@ -554,25 +584,25 @@ public:
                 uint32_t cnt = counts[i].load(std::memory_order_relaxed);
                 if (cnt >= min_count_) {
                     uint64_t kmer = (partition_id << prefix_shift) | i;
-                    local_kmers.emplace_back(kmer, cnt);
+                    local_high_freq.emplace_back(kmer, cnt);
                     ++local_count;
                 }
                 counts[i].store(0, std::memory_order_relaxed);  // 重置供下一分区使用
             }
 
-            if (!local_kmers.empty()) {
+            if (!local_high_freq.empty()) {
                 #pragma omp critical
                 {
                     high_freq_kmers_.insert(high_freq_kmers_.end(),
-                                            local_kmers.begin(),
-                                            local_kmers.end());
+                                            local_high_freq.begin(),
+                                            local_high_freq.end());
                 }
             }
             high_freq_count += local_count;
         }
         
         std::cerr << "  分区 " << (partition_id + 1) << "/" << num_partitions_ 
-                  << ": 处理 " << partition_kmers.load() << " 个 k-mer, "
+                  << " 完成: 处理 " << partition_kmers.load() << " 个 k-mer, "
                   << "保留 " << high_freq_count << " 个高频 k-mer\n";
     }
     
@@ -605,16 +635,22 @@ public:
                   << std::chrono::duration_cast<std::chrono::milliseconds>(t_init_end - t_init_begin).count()
                   << " ms\n";
 
-        std::cerr << "Start process_partition_mt" << std::endl;
-
         for (uint64_t p = 0; p < num_partitions_; ++p) {
-            process_partition_mt(store, p, counts);
+            std::atomic<bool> progress_done{false};
+            auto t_partition_start = std::chrono::high_resolution_clock::now();
+            
+            process_partition_mt(store, p, counts, progress_done);
+            
+            auto t_partition_end = std::chrono::high_resolution_clock::now();
+            std::cerr << "  分区 " << (p + 1) << " 耗时: "
+                      << std::chrono::duration_cast<std::chrono::seconds>(t_partition_end - t_partition_start).count()
+                      << " 秒\n";
         }
         
         auto t_end = std::chrono::high_resolution_clock::now();
         std::cerr << "统计完成: 总共处理 " << total_kmers_processed_.load() << " 个 k-mer, "
                   << "保留 " << high_freq_kmers_.size() << " 个高频 k-mer\n";
-        std::cerr << "统计耗时: " 
+        std::cerr << "总耗时: " 
                   << std::chrono::duration_cast<std::chrono::seconds>(t_end - t_start).count() 
                   << " 秒\n";
     }
