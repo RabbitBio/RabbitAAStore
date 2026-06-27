@@ -3,31 +3,135 @@
 #include "PagedProteinAAStore.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
-static uint64_t g_kseq_bytes_read = 0;
+static std::atomic<uint64_t> g_kseq_bytes_read{0};
 
 static inline size_t kseq_file_read(FILE* fp, void* buf, size_t size) {
     size_t read_bytes = fread(buf, 1, size, fp);
-    g_kseq_bytes_read += static_cast<uint64_t>(read_bytes);
+    g_kseq_bytes_read.fetch_add(static_cast<uint64_t>(read_bytes),
+                                std::memory_order_relaxed);
     return read_bytes;
 }
 
 KSEQ_INIT(FILE*, kseq_file_read)
+
+static inline bool fasta_header_name_delim(unsigned char c) {
+    return c <= ' ';
+}
+
+static inline size_t fasta_direct_read(FILE* fp, void* buf, size_t size) {
+#if defined(__GLIBC__) || defined(__linux__)
+    return fread_unlocked(buf, 1, size, fp);
+#else
+    return std::fread(buf, 1, size, fp);
+#endif
+}
+
+static uint64_t drop_input_file_cache(FILE* fp) {
+    if (fp == nullptr) return 0;
+#if defined(POSIX_FADV_DONTNEED)
+    auto start = std::chrono::steady_clock::now();
+    (void)::posix_fadvise(::fileno(fp), 0, 0, POSIX_FADV_DONTNEED);
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+#else
+    return 0;
+#endif
+}
+
+class FastaInputCacheAdvice {
+public:
+    explicit FastaInputCacheAdvice(FILE* fp, bool drop_old_input_cache)
+        : drop_old_input_cache_(drop_old_input_cache) {
+#if defined(POSIX_FADV_SEQUENTIAL) || defined(POSIX_FADV_DONTNEED)
+        fd_ = ::fileno(fp);
+#endif
+#if defined(POSIX_FADV_SEQUENTIAL)
+        if (fd_ >= 0) {
+            (void)::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+        }
+#endif
+    }
+
+    void prefetch_ahead(uint64_t consumed_bytes) {
+#if defined(POSIX_FADV_WILLNEED)
+        if (fd_ < 0) return;
+        const uint64_t target = consumed_bytes + prefetch_window_bytes_;
+        if (target <= prefetched_until_ + prefetch_step_bytes_) return;
+        const uint64_t start = prefetched_until_;
+        const uint64_t bytes = target - prefetched_until_;
+        (void)::posix_fadvise(fd_, static_cast<off_t>(start),
+                              static_cast<off_t>(bytes),
+                              POSIX_FADV_WILLNEED);
+        prefetched_until_ = target;
+#else
+        (void)consumed_bytes;
+#endif
+    }
+
+    void drop_old_ranges(uint64_t consumed_bytes) {
+#if defined(POSIX_FADV_DONTNEED)
+        if (!drop_old_input_cache_ || fd_ < 0 ||
+            consumed_bytes <= keep_tail_bytes_) {
+            return;
+        }
+        const uint64_t drop_end = consumed_bytes - keep_tail_bytes_;
+        if (drop_end < dropped_until_ + drop_step_bytes_) return;
+        const uint64_t drop_bytes = drop_end - dropped_until_;
+        (void)::posix_fadvise(fd_, static_cast<off_t>(dropped_until_),
+                              static_cast<off_t>(drop_bytes),
+                              POSIX_FADV_DONTNEED);
+        dropped_until_ = drop_end;
+#else
+        (void)consumed_bytes;
+#endif
+    }
+
+private:
+    static constexpr uint64_t keep_tail_bytes_ = 64ULL * 1024ULL * 1024ULL;
+    static constexpr uint64_t drop_step_bytes_ = 256ULL * 1024ULL * 1024ULL;
+    static constexpr uint64_t prefetch_window_bytes_ = 256ULL * 1024ULL * 1024ULL;
+    static constexpr uint64_t prefetch_step_bytes_ = 64ULL * 1024ULL * 1024ULL;
+    int fd_ = -1;
+    uint64_t dropped_until_ = 0;
+    uint64_t prefetched_until_ = 0;
+    bool drop_old_input_cache_ = false;
+};
+
+struct DirectFastaParseStats {
+    uint64_t read_ns = 0;
+    uint64_t parse_ns = 0;
+    uint64_t advice_ns = 0;
+    uint64_t read_calls = 0;
+    uint64_t chunks = 0;
+    uint64_t fragments = 0;
+    uint64_t header_fragments = 0;
+    uint64_t sequence_fragments = 0;
+    uint64_t header_fragment_bytes = 0;
+    uint64_t sequence_fragment_bytes = 0;
+};
 
 template <typename BeginSequence, typename AppendResidues,
           typename EndSequence, typename OnHeader>
@@ -35,9 +139,10 @@ static bool stream_fasta_direct(FILE* fp,
                                 BeginSequence&& begin_sequence,
                                 AppendResidues&& append_residues,
                                 EndSequence&& end_sequence,
-                                OnHeader&& on_header) {
-    constexpr size_t buffer_bytes = 1024ULL * 1024ULL;
-    std::vector<char> buffer(buffer_bytes);
+                                OnHeader&& on_header,
+                                bool async_read,
+                                DirectFastaParseStats* stats = nullptr) {
+    constexpr size_t buffer_bytes = 16ULL * 1024ULL * 1024ULL;
     std::string header_name;
     bool sequence_open = false;
     bool in_header = false;
@@ -63,7 +168,7 @@ static bool stream_fasta_direct(FILE* fp,
         if (header_name_done) return;
         size_t pos = 0;
         while (pos < len &&
-               !std::isspace(static_cast<unsigned char>(data[pos]))) {
+               !fasta_header_name_delim(static_cast<unsigned char>(data[pos]))) {
             ++pos;
         }
         header_name.append(data, pos);
@@ -100,17 +205,11 @@ static bool stream_fasta_direct(FILE* fp,
         return len == 0 || append_residues(data, len);
     };
 
-    while (true) {
-        size_t read_bytes = std::fread(buffer.data(), 1, buffer.size(), fp);
-        g_kseq_bytes_read += static_cast<uint64_t>(read_bytes);
-        if (read_bytes == 0) {
-            if (std::ferror(fp)) return false;
-            break;
-        }
-
+    auto parse_buffer = [&](const char* buffer, size_t read_bytes) -> bool {
+        const auto parse_start = std::chrono::steady_clock::now();
         size_t pos = 0;
         while (pos < read_bytes) {
-            const char* chunk = buffer.data() + pos;
+            const char* chunk = buffer + pos;
             const void* newline_ptr =
                 std::memchr(chunk, '\n', read_bytes - pos);
             const bool line_ended = newline_ptr != nullptr;
@@ -118,14 +217,28 @@ static bool stream_fasta_direct(FILE* fp,
                 ? static_cast<size_t>(static_cast<const char*>(newline_ptr) - chunk)
                 : read_bytes - pos;
 
+            if (stats) ++stats->fragments;
             if (in_header) {
+                if (stats) {
+                    ++stats->header_fragments;
+                    stats->header_fragment_bytes += static_cast<uint64_t>(fragment_len);
+                }
                 append_header_fragment(chunk, fragment_len);
                 if (line_ended && !finish_header()) return false;
             } else if (at_line_start && fragment_len != 0 && chunk[0] == '>') {
+                if (stats) {
+                    ++stats->header_fragments;
+                    stats->header_fragment_bytes +=
+                        static_cast<uint64_t>(fragment_len - 1);
+                }
                 if (!start_header()) return false;
                 append_header_fragment(chunk + 1, fragment_len - 1);
                 if (line_ended && !finish_header()) return false;
             } else {
+                if (stats) {
+                    ++stats->sequence_fragments;
+                    stats->sequence_fragment_bytes += static_cast<uint64_t>(fragment_len);
+                }
                 if (!append_sequence_fragment(chunk, fragment_len, line_ended)) {
                     return false;
                 }
@@ -135,7 +248,199 @@ static bool stream_fasta_direct(FILE* fp,
             if (!line_ended) break;
             pos += fragment_len + 1;
         }
+        if (stats) {
+            stats->parse_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - parse_start).count());
+        }
+        return true;
+    };
+
+    if (!async_read) {
+        std::vector<char> buffer(buffer_bytes);
+        FastaInputCacheAdvice input_cache(fp, false);
+        uint64_t consumed_bytes = 0;
+        auto advice_start = std::chrono::steady_clock::now();
+        input_cache.prefetch_ahead(consumed_bytes);
+        if (stats) {
+            stats->advice_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - advice_start).count());
+        }
+        while (true) {
+            const auto read_start = std::chrono::steady_clock::now();
+            size_t read_bytes = fasta_direct_read(fp, buffer.data(), buffer.size());
+            const auto read_end = std::chrono::steady_clock::now();
+            if (stats) {
+                stats->read_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        read_end - read_start).count());
+                ++stats->read_calls;
+                if (read_bytes != 0) ++stats->chunks;
+            }
+            consumed_bytes += static_cast<uint64_t>(read_bytes);
+            g_kseq_bytes_read.fetch_add(static_cast<uint64_t>(read_bytes),
+                                        std::memory_order_relaxed);
+            advice_start = std::chrono::steady_clock::now();
+            input_cache.prefetch_ahead(consumed_bytes);
+            input_cache.drop_old_ranges(consumed_bytes);
+            const auto advice_end = std::chrono::steady_clock::now();
+            if (stats) {
+                stats->advice_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        advice_end - advice_start).count());
+            }
+            if (read_bytes == 0) {
+                if (std::ferror(fp)) return false;
+                break;
+            }
+            if (!parse_buffer(buffer.data(), read_bytes)) return false;
+        }
+
+        if (in_header && !finish_header()) {
+            return false;
+        }
+        pending_sequence_cr = false;
+        return finish_sequence_if_open();
     }
+
+    struct ReadSlot {
+        std::vector<char> buffer;
+        size_t bytes = 0;
+        bool ready = false;
+        bool free = true;
+    };
+
+    std::array<ReadSlot, 2> slots;
+    for (ReadSlot& slot : slots) slot.buffer.resize(buffer_bytes);
+
+    std::mutex reader_mutex;
+    std::condition_variable reader_cv;
+    bool reader_stop = false;
+    bool reader_eof = false;
+    bool reader_failed = false;
+    uint64_t reader_consumed_bytes = 0;
+    uint64_t reader_read_ns = 0;
+    uint64_t reader_advice_ns = 0;
+    uint64_t reader_read_calls = 0;
+    uint64_t reader_chunks = 0;
+
+    auto reader_thread = std::thread([&]() {
+        FastaInputCacheAdvice input_cache(fp, false);
+        size_t fill_slot = 0;
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(reader_mutex);
+                reader_cv.wait(lock, [&]() {
+                    return reader_stop || slots[fill_slot].free;
+                });
+                if (reader_stop) break;
+                slots[fill_slot].free = false;
+                slots[fill_slot].ready = false;
+                slots[fill_slot].bytes = 0;
+            }
+
+            const auto read_start = std::chrono::steady_clock::now();
+            size_t read_bytes = fasta_direct_read(
+                fp, slots[fill_slot].buffer.data(), slots[fill_slot].buffer.size());
+            const auto read_end = std::chrono::steady_clock::now();
+            reader_read_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    read_end - read_start).count());
+            ++reader_read_calls;
+            if (read_bytes != 0) ++reader_chunks;
+
+            if (read_bytes == 0) {
+                const bool failed = std::ferror(fp) != 0;
+                {
+                    std::lock_guard<std::mutex> lock(reader_mutex);
+                    slots[fill_slot].free = true;
+                    reader_failed = failed;
+                    reader_eof = true;
+                }
+                reader_cv.notify_all();
+                break;
+            }
+
+            reader_consumed_bytes += static_cast<uint64_t>(read_bytes);
+            g_kseq_bytes_read.fetch_add(static_cast<uint64_t>(read_bytes),
+                                        std::memory_order_relaxed);
+
+            const auto advice_start = std::chrono::steady_clock::now();
+            input_cache.prefetch_ahead(reader_consumed_bytes);
+            input_cache.drop_old_ranges(reader_consumed_bytes);
+            const auto advice_end = std::chrono::steady_clock::now();
+            reader_advice_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    advice_end - advice_start).count());
+
+            {
+                std::lock_guard<std::mutex> lock(reader_mutex);
+                slots[fill_slot].bytes = read_bytes;
+                slots[fill_slot].ready = true;
+            }
+            reader_cv.notify_all();
+            fill_slot ^= 1;
+        }
+    });
+
+    bool reader_joined = false;
+    auto finish_reader = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(reader_mutex);
+            reader_stop = true;
+        }
+        reader_cv.notify_all();
+        if (reader_thread.joinable()) reader_thread.join();
+        if (!reader_joined && stats) {
+            stats->read_ns += reader_read_ns;
+            stats->advice_ns += reader_advice_ns;
+            stats->read_calls += reader_read_calls;
+            stats->chunks += reader_chunks;
+        }
+        reader_joined = true;
+    };
+
+    size_t parse_slot = 0;
+    while (true) {
+        size_t read_bytes = 0;
+        bool failed_without_ready = false;
+        bool done_without_ready = false;
+        {
+            std::unique_lock<std::mutex> lock(reader_mutex);
+            reader_cv.wait(lock, [&]() {
+                return slots[parse_slot].ready || reader_eof || reader_failed;
+            });
+            if (!slots[parse_slot].ready) {
+                failed_without_ready = reader_failed;
+                done_without_ready = !reader_failed;
+            } else {
+                read_bytes = slots[parse_slot].bytes;
+                slots[parse_slot].ready = false;
+            }
+        }
+        if (failed_without_ready) {
+            finish_reader();
+            return false;
+        }
+        if (done_without_ready) break;
+
+        const bool parsed =
+            parse_buffer(slots[parse_slot].buffer.data(), read_bytes);
+        {
+            std::lock_guard<std::mutex> lock(reader_mutex);
+            slots[parse_slot].bytes = 0;
+            slots[parse_slot].free = true;
+        }
+        reader_cv.notify_all();
+        if (!parsed) {
+            finish_reader();
+            return false;
+        }
+        parse_slot ^= 1;
+    }
+
+    finish_reader();
 
     if (in_header && !finish_header()) {
         return false;
@@ -259,20 +564,62 @@ int main(int argc, char** argv) {
 
     std::string fasta_path;
     std::string names_output;
+    std::string name_index_output;
     bool no_names = false;
+    bool build_name_index = false;
     bool stop_aware = true;
     bool fast_encoding = false;
+    bool build_direct_output = false;
+    bool build_reader_thread = true;
+    bool drop_input_cache = false;
     uint64_t min_length = 0;
     uint64_t build_threads = 2;
+    std::string build_io_policy = "balanced";
+    uint64_t build_write_buffer_mb =
+        PagedProteinAAStore::default_build_write_buffer_bytes() / (1024ULL * 1024ULL);
+    uint64_t build_page_buffer_mb =
+        PagedProteinAAStore::BufferedPageWriter::default_buffer_bytes /
+        (1024ULL * 1024ULL);
+    uint64_t build_writeback_step_mb =
+        PagedProteinAAStore::BufferedPageWriter::default_writeback_step_bytes /
+        (1024ULL * 1024ULL);
     auto build_fa = app.add_subcommand("build-fa", "Stream-build paged store directly from FASTA");
     build_fa->add_option("-f,--fasta", fasta_path, "Input FASTA file")->required()->check(CLI::ExistingFile);
     build_fa->add_option("-o,--output", output_dir, "Output directory for meta.bin and pages.bin")->required();
     build_fa->add_option("--names-output", names_output, "Output FASTA sequence names, one kept sequence per line. Default: seq_names.txt in output directory");
     build_fa->add_flag("--no-names", no_names, "Do not write seq_names.txt during FASTA build");
+    build_fa->add_flag("--name-index", build_name_index, "Also build seq_names.index.bin for fast name loading");
+    build_fa->add_option("--name-index-output", name_index_output, "Output binary name index. Default: seq_names.index.bin next to seq_names.txt");
     build_fa->add_flag("--stop-aware", stop_aware, "Preserve '*' by encoding it as code 27; enabled by default");
     build_fa->add_flag("--fast-encoding", fast_encoding, "Use legacy low-5-bit encoding; '*' collides with J");
+    build_fa->add_flag("--build-direct-output", build_direct_output, "Write pages.bin with O_DIRECT using an aligned buffer; experimental");
+    build_fa->add_flag("--build-reader-thread,!--no-build-reader-thread",
+                       build_reader_thread,
+                       "Use a dedicated FASTA reader thread when -j >= 2; "
+                       "enabled by default. Disable to use input prefetch in the producer thread");
+    build_fa->add_flag("--drop-input-cache", drop_input_cache,
+                       "Ask the kernel to evict the input FASTA from OS page cache before building");
     build_fa->add_option("-L,--min-length", min_length, "Minimum sequence length filter, default 0");
-    build_fa->add_option("-j,--threads", build_threads, "Worker threads for FASTA page packing, default 2; 0 uses hardware concurrency");
+    build_fa->add_option(
+        "-j,--threads", build_threads,
+        "Total build threads, default 2; 1 uses producer-side input prefetch, "
+        "N>=2 reserves one thread for double-buffered FASTA reading unless "
+        "--no-build-reader-thread is set; "
+        "0 uses hardware concurrency");
+    build_fa->add_option(
+        "--build-io-policy", build_io_policy,
+        "Build write policy: balanced writes packed pages as soon as ready; "
+        "read-first buffers packed pages and writes only when the buffer is near full or FASTA reading is done")
+        ->check(CLI::IsMember({"balanced", "read-first", "read_first"}));
+    build_fa->add_option(
+        "--build-write-buffer-mb", build_write_buffer_mb,
+        "Packed page result buffer budget for --build-io-policy read-first, default 4096 MiB");
+    build_fa->add_option(
+        "--build-page-buffer-mb", build_page_buffer_mb,
+        "Buffered pages.bin write buffer in MiB, default 4");
+    build_fa->add_option(
+        "--build-writeback-step-mb", build_writeback_step_mb,
+        "sync_file_range writeback step in MiB for pages.bin; 0 disables explicit writeback hints, default 512");
 
     std::string store_dir;
     uint64_t memory_mb = 0;
@@ -283,6 +630,7 @@ int main(int argc, char** argv) {
         PagedProteinAAStore::default_prefetch_memory_cap_bytes() / (1024ULL * 1024ULL);
     uint64_t preload_threads = 0;
     uint64_t prefetch_threads = 2;
+    uint64_t decode_threads = 1;
     uint64_t prefetch_depth = 0;
     uint64_t single_thread_aio_completions = 64;
     uint64_t aio_completion_min = 4;
@@ -290,11 +638,14 @@ int main(int argc, char** argv) {
     std::string cache_policy = "lru";
     bool batch_mode = false;
     bool batch_into_mode = false;
+    bool bench_by_name = false;
     bool preload_cache = false;
     bool no_preload_cache = false;
     bool drop_page_cache = false;
     bool single_thread_aio = false;
     bool uring_sqpoll = false;
+    bool load_names = false;
+    std::string bench_names_path;
 
     auto bench = app.add_subcommand("bench", "Benchmark random access on a paged store");
     bench->add_option("-i,--input", store_dir, "Paged store directory")->required()->check(CLI::ExistingDirectory);
@@ -305,8 +656,11 @@ int main(int argc, char** argv) {
     bench->add_option("--memory-mb,--cache-mb", memory_mb, "Resident page-cache memory budget in MiB; 0/default loads all pages; --cache-mb is a legacy alias");
     bench->add_flag("--batch", batch_mode, "Force batch_get even when --prefetch-mb 0; default nonzero prefetch already uses batch_get");
     bench->add_flag("--batch-into", batch_into_mode, "Benchmark batch_get_into with caller-preallocated output buffers");
+    bench->add_flag("--by-name", bench_by_name, "Benchmark name lookup plus sequence access using batch_get_by_name/get_by_name");
     bench->add_option("--prefetch-mb", prefetch_mb, "Temporary miss-page buffer upper bound in MiB for half-memory access; effective value is capped by the library default, 0 disables batch prefetch");
     bench->add_option("--prefetch-threads", prefetch_threads, "Total I/O streams including the caller thread, default 2; 1 or 0 uses caller only");
+    bench->add_option("--decode-threads", decode_threads, "Full-memory batch_get_into decode threads, default 1")
+        ->check(CLI::PositiveNumber);
     bench->add_option("--prefetch-depth", prefetch_depth, "Advanced override: outstanding async reads per I/O stream; 0/default lets the library choose from --prefetch-mb");
     bench->add_option("--io-backend", io_backend, "Advanced override: auto prefers io_uring, then native AIO, then pread");
     bench->add_option("--cache-policy", cache_policy, "Resident cache policy: lru uses 2Q-lite and promotes only recent second misses; prefix keeps only the preloaded prefix")
@@ -319,17 +673,32 @@ int main(int argc, char** argv) {
     bench->add_flag("--preload-cache", preload_cache, "Legacy flag; preload is automatic for --memory-mb > 0 and full preload is automatic when memory fits pages.bin");
     bench->add_flag("--no-preload-cache", no_preload_cache, "Benchmark only: do not preload resident PageCache before timed access");
     bench->add_option("--preload-threads", preload_threads, "Advanced override: preload threads; default 0 chooses up to 16 automatically");
+    bench->add_flag("--load-names", load_names, "Load seq_names.txt into memory and build name->id index");
+    bench->add_option("--names-path", bench_names_path, "Override sequence names path; default is seq_names.txt in the store directory");
 
     uint64_t seq_id = 0;
+    std::string seq_name;
+    std::string get_names_path;
     auto get = app.add_subcommand("get", "Print one sequence from a paged store");
     get->add_option("-i,--input", store_dir, "Paged store directory")->required()->check(CLI::ExistingDirectory);
-    get->add_option("--id", seq_id, "Sequence id")->required();
+    auto get_id_option = get->add_option("--id", seq_id, "Sequence id");
+    auto get_name_option = get->add_option("--name", seq_name, "Sequence name");
+    get->add_option("--names-path", get_names_path, "Override sequence names path; default is seq_names.txt in the store directory");
     get->add_option("--memory-mb,--cache-mb", memory_mb, "Resident page-cache memory budget in MiB; 0/default loads all pages; --cache-mb is a legacy alias");
     get->add_option("--cache-policy", cache_policy, "Resident cache policy: lru (2Q-lite) or prefix")
         ->check(CLI::IsMember({"lru", "lru_2q_lite", "2q_lite", "prefix", "non-lru", "non_lru"}));
 
     app.require_subcommand(1);
     CLI11_PARSE(app, argc, argv);
+
+    if (*get) {
+        const bool has_id = get_id_option->count() != 0;
+        const bool has_name = get_name_option->count() != 0;
+        if (has_id == has_name) {
+            std::cerr << "Error: get requires exactly one of --id or --name\n";
+            return 1;
+        }
+    }
 
     bool use_single_thread_aio = single_thread_aio || prefetch_threads == 0;
     if (*bench && use_single_thread_aio) {
@@ -398,6 +767,14 @@ int main(int argc, char** argv) {
         if (!no_names && names_output.empty()) {
             names_output = (fs::path(output_dir) / "seq_names.txt").string();
         }
+        if (build_name_index && no_names) {
+            std::cerr << "Error: --name-index requires sequence names; remove --no-names\n";
+            return 1;
+        }
+        if (build_name_index && name_index_output.empty()) {
+            name_index_output =
+                PagedProteinAAStore::default_name_index_path(names_output);
+        }
         std::ofstream names_out;
         if (!no_names) {
             names_out.open(names_output, std::ios::binary);
@@ -414,7 +791,7 @@ int main(int argc, char** argv) {
             fasta_size = 0;
         }
 
-        g_kseq_bytes_read = 0;
+        g_kseq_bytes_read.store(0, std::memory_order_relaxed);
 
         uint64_t read_count = 0;
         uint64_t kept_count = 0;
@@ -427,7 +804,8 @@ int main(int argc, char** argv) {
         };
         auto update_progress = [&](bool force = false) {
             if (!force && read_count % progress_interval != 0) return;
-            progress.update(g_kseq_bytes_read, progress_detail(), force);
+            progress.update(g_kseq_bytes_read.load(std::memory_order_relaxed),
+                            progress_detail(), force);
         };
         update_progress(true);
 
@@ -461,22 +839,9 @@ int main(int argc, char** argv) {
         };
         auto append_name = [&](const char* name, size_t name_len) -> bool {
             if (no_names) return true;
-            constexpr uint64_t timing_sample_stride = 1024;
-            const bool sample_append =
-                kept_count % timing_sample_stride == 0;
-            std::chrono::steady_clock::time_point append_start;
-            if (sample_append) {
-                append_start = std::chrono::steady_clock::now();
-            }
             names_buffer.append(name, name_len);
             names_buffer.push_back('\n');
             names_bytes += static_cast<uint64_t>(name_len + 1);
-            if (sample_append) {
-                names_append_sample_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - append_start).count());
-                names_append_sample_bytes += static_cast<uint64_t>(name_len + 1);
-            }
             if (names_buffer.size() >= names_buffer_limit) {
                 return flush_names();
             }
@@ -485,6 +850,8 @@ int main(int argc, char** argv) {
 
         auto start = std::chrono::high_resolution_clock::now();
         PagedProteinAAStore::BuildStats build_stats;
+        DirectFastaParseStats direct_parse_stats;
+        uint64_t drop_input_cache_ns = 0;
         if (fast_encoding) stop_aware = false;
         const auto encoding_mode = stop_aware
             ? PagedProteinAAStore::EncodingMode::StopAware
@@ -492,7 +859,23 @@ int main(int argc, char** argv) {
         const size_t effective_build_threads = static_cast<size_t>(
             build_threads == 0 ? std::max(1u, std::thread::hardware_concurrency())
                                : build_threads);
+        const bool async_direct_read = build_reader_thread && effective_build_threads >= 2;
+        const size_t reserved_reader_threads = async_direct_read ? 1 : 0;
+        const size_t pack_worker_threads =
+            effective_build_threads > 1 + reserved_reader_threads
+                ? effective_build_threads - 1 - reserved_reader_threads
+                : 0;
         const bool direct_task_parser = min_length == 0;
+        const auto build_policy =
+            (build_io_policy == "read-first" || build_io_policy == "read_first")
+                ? PagedProteinAAStore::BuildIoPolicy::ReadFirst
+                : PagedProteinAAStore::BuildIoPolicy::Balanced;
+        const uint64_t build_write_buffer_bytes =
+            build_write_buffer_mb * 1024ULL * 1024ULL;
+        const uint64_t build_page_buffer_bytes =
+            build_page_buffer_mb * 1024ULL * 1024ULL;
+        const uint64_t build_writeback_step_bytes =
+            build_writeback_step_mb * 1024ULL * 1024ULL;
         bool ok = false;
         if (direct_task_parser) {
             FILE* fp = std::fopen(fasta_path.c_str(), "rb");
@@ -500,33 +883,37 @@ int main(int argc, char** argv) {
                 std::cerr << "Error: failed to open FASTA: " << fasta_path << "\n";
                 return 1;
             }
+            if (drop_input_cache) {
+                drop_input_cache_ns = drop_input_file_cache(fp);
+            }
 
             auto direct_stream = [&](auto&& begin_sequence,
                                      auto&& append_residues,
                                      auto&& end_sequence) -> bool {
                 auto on_header = [&](const char* header, size_t header_len) -> bool {
-                    size_t name_len = 0;
-                    while (name_len < header_len &&
-                           !std::isspace(static_cast<unsigned char>(header[name_len]))) {
-                        ++name_len;
-                    }
                     ++read_count;
-                    if (!append_name(header, name_len)) return false;
+                    if (!append_name(header, header_len)) return false;
                     ++kept_count;
                     update_progress();
                     return true;
                 };
                 return stream_fasta_direct(fp, begin_sequence, append_residues,
-                                           end_sequence, on_header);
+                                           end_sequence, on_header,
+                                           async_direct_read,
+                                           &direct_parse_stats);
             };
-            if (effective_build_threads <= 1) {
+            if (pack_worker_threads == 0) {
                 ok = PagedProteinAAStore::build_from_sequence_stream(
                     output_dir, page_residues, direct_stream, &build_stats,
-                    encoding_mode);
+                    encoding_mode, build_page_buffer_bytes,
+                    build_writeback_step_bytes, build_direct_output);
             } else {
                 ok = PagedProteinAAStore::build_from_sequence_stream_parallel(
                     output_dir, page_residues, direct_stream,
-                    effective_build_threads, &build_stats, encoding_mode);
+                    pack_worker_threads, &build_stats, encoding_mode,
+                    build_policy, build_write_buffer_bytes,
+                    build_page_buffer_bytes, build_writeback_step_bytes,
+                    build_direct_output);
             }
             std::fclose(fp);
         } else {
@@ -534,6 +921,9 @@ int main(int argc, char** argv) {
             if (!fp) {
                 std::cerr << "Error: failed to open FASTA: " << fasta_path << "\n";
                 return 1;
+            }
+            if (drop_input_cache) {
+                drop_input_cache_ns = drop_input_file_cache(fp);
             }
             kseq_t* seq = kseq_init(fp);
             if (!seq) {
@@ -559,10 +949,16 @@ int main(int argc, char** argv) {
                 }
                 return false;
             };
-            ok = PagedProteinAAStore::build_from_sequence_views_parallel(
-                output_dir, page_residues, next_sequence,
-                static_cast<size_t>(build_threads), &build_stats,
-                encoding_mode);
+            if (effective_build_threads <= 1) {
+                ok = PagedProteinAAStore::build_from_sequence_views_parallel(
+                    output_dir, page_residues, next_sequence,
+                    size_t{1}, &build_stats, encoding_mode);
+            } else {
+                ok = PagedProteinAAStore::build_from_sequence_views_parallel(
+                    output_dir, page_residues, next_sequence,
+                    effective_build_threads - 1, &build_stats,
+                    encoding_mode);
+            }
             kseq_destroy(seq);
             std::fclose(fp);
         }
@@ -574,6 +970,12 @@ int main(int argc, char** argv) {
         if (!no_names) {
             names_out.close();
         }
+        PagedProteinAAStore::NameIndexStats name_index_stats;
+        bool name_index_ok = true;
+        if (build_name_index) {
+            name_index_ok = PagedProteinAAStore::build_name_index(
+                names_output, name_index_output, kept_count, &name_index_stats);
+        }
         auto end = std::chrono::high_resolution_clock::now();
         if (names_append_sample_bytes != 0) {
             names_append_ns = static_cast<uint64_t>(
@@ -582,9 +984,14 @@ int main(int argc, char** argv) {
                 static_cast<long double>(names_append_sample_bytes));
         }
 
-        if (!ok || names_write_error || (!no_names && !names_out)) {
+        if (!ok || names_write_error || (!no_names && !names_out) ||
+            !name_index_ok) {
             if (names_write_error || (!no_names && !names_out)) {
                 std::cerr << "Error: failed to write sequence names to " << names_output << "\n";
+            }
+            if (!name_index_ok) {
+                std::cerr << "Error: failed to build sequence name index: "
+                          << name_index_output << "\n";
             }
             std::cerr << "Error: failed to stream-build paged store from FASTA\n";
             return 1;
@@ -597,6 +1004,12 @@ int main(int argc, char** argv) {
         } else {
             std::cout << "Names output: " << fs::absolute(names_output).string() << "\n";
         }
+        if (build_name_index) {
+            std::cout << "Name index output: "
+                      << fs::absolute(name_index_output).string() << "\n";
+        } else {
+            std::cout << "Name index output: disabled\n";
+        }
         std::cout << "Read seqs: " << read_count << "\n";
         std::cout << "Kept seqs: " << kept_count << "\n";
         std::cout << "Packed page bytes: " << fixed_packed_page_bytes() << "\n";
@@ -608,6 +1021,32 @@ int main(int argc, char** argv) {
         std::cout << "Build encoding_mode: "
                   << PagedProteinAAStore::encoding_mode_name(encoding_mode) << "\n";
         std::cout << "Build threads: " << effective_build_threads << "\n";
+        std::cout << "Build drop_input_cache: " << (drop_input_cache ? 1 : 0) << "\n";
+        std::cout << "Build drop_input_cache_ms: "
+                  << (drop_input_cache_ns / 1000000.0) << "\n";
+        std::cout << "Build reader_threads: "
+                  << (direct_task_parser && async_direct_read ? 1 : 0) << "\n";
+        std::cout << "Build input_prefetch: "
+                  << (direct_task_parser && !async_direct_read ? 1 : 0) << "\n";
+        std::cout << "Build pack_threads: "
+                  << (direct_task_parser
+                          ? pack_worker_threads
+                          : (effective_build_threads <= 1
+                                 ? size_t{0}
+                                 : effective_build_threads - 1))
+                  << "\n";
+        std::cout << "Build direct_page_fast_path: "
+                  << (direct_task_parser && pack_worker_threads == 0 ? 1 : 0)
+                  << "\n";
+        std::cout << "Build io_policy: "
+                  << (build_policy == PagedProteinAAStore::BuildIoPolicy::ReadFirst
+                          ? "read-first"
+                          : "balanced")
+                  << "\n";
+        std::cout << "Build write_buffer_mb: " << build_write_buffer_mb << "\n";
+        std::cout << "Build page_buffer_mb: " << build_page_buffer_mb << "\n";
+        std::cout << "Build writeback_step_mb: " << build_writeback_step_mb << "\n";
+        std::cout << "Build direct_output: " << (build_direct_output ? 1 : 0) << "\n";
         if (direct_task_parser) {
             std::cout << "Build read_ms_est: n/a (direct parser; included in producer_ms)\n";
             std::cout << "Build raw_copy_ms_est: n/a (direct parser; included in producer_ms)\n";
@@ -616,13 +1055,67 @@ int main(int argc, char** argv) {
             std::cout << "Build raw_copy_ms_est: " << (build_stats.raw_copy_ns / 1000000.0) << "\n";
         }
         std::cout << "Build producer_ms: " << (build_stats.producer_ns / 1000000.0) << "\n";
+        if (direct_task_parser) {
+            std::cout << "Build direct_read_ms: "
+                      << (direct_parse_stats.read_ns / 1000000.0) << "\n";
+            std::cout << "Build direct_parse_ms: "
+                      << (direct_parse_stats.parse_ns / 1000000.0) << "\n";
+            std::cout << "Build direct_fadvise_ms: "
+                      << (direct_parse_stats.advice_ns / 1000000.0) << "\n";
+            std::cout << "Build direct_read_calls: "
+                      << direct_parse_stats.read_calls << "\n";
+            std::cout << "Build direct_chunks: "
+                      << direct_parse_stats.chunks << "\n";
+            std::cout << "Build direct_fragments: "
+                      << direct_parse_stats.fragments << "\n";
+            std::cout << "Build direct_header_fragments: "
+                      << direct_parse_stats.header_fragments << "\n";
+            std::cout << "Build direct_sequence_fragments: "
+                      << direct_parse_stats.sequence_fragments << "\n";
+            std::cout << "Build direct_header_fragment_bytes: "
+                      << direct_parse_stats.header_fragment_bytes << "\n";
+            std::cout << "Build direct_sequence_fragment_bytes: "
+                      << direct_parse_stats.sequence_fragment_bytes << "\n";
+        }
         std::cout << "Build enqueue_wait_ms: " << (build_stats.enqueue_wait_ns / 1000000.0) << "\n";
-        std::cout << "Build names_append_ms_est: " << (names_append_ns / 1000000.0) << "\n";
+        if (direct_task_parser) {
+            std::cout << "Build names_append_ms_est: n/a (included in producer_ms)\n";
+        } else {
+            std::cout << "Build names_append_ms_est: " << (names_append_ns / 1000000.0) << "\n";
+        }
         std::cout << "Build names_write_ms: " << (names_write_ns / 1000000.0) << "\n";
         std::cout << "Build names_bytes: " << names_bytes << "\n";
         std::cout << "Build names_flushes: " << names_flushes << "\n";
+        std::cout << "Build name_index_read_ms: "
+                  << (name_index_stats.read_ns / 1000000.0) << "\n";
+        std::cout << "Build name_index_scan_ms: "
+                  << (name_index_stats.scan_offsets_ns / 1000000.0) << "\n";
+        std::cout << "Build name_index_hash_ms: "
+                  << (name_index_stats.build_hash_ns / 1000000.0) << "\n";
+        std::cout << "Build name_index_write_ms: "
+                  << (name_index_stats.write_ns / 1000000.0) << "\n";
+        std::cout << "Build name_index_bytes: " << name_index_stats.index_bytes << "\n";
+        std::cout << "Build name_index_slots: " << name_index_stats.hash_slots << "\n";
         std::cout << "Build pack_worker_ms_total: " << (build_stats.pack_ns / 1000000.0) << "\n";
         std::cout << "Build write_ms: " << (build_stats.write_ns / 1000000.0) << "\n";
+        std::cout << "Build page_write_buffer_bytes: "
+                  << build_stats.page_write_buffer_bytes << "\n";
+        std::cout << "Build page_writeback_step_bytes: "
+                  << build_stats.page_writeback_step_bytes << "\n";
+        std::cout << "Build page_output_direct: "
+                  << build_stats.page_output_direct << "\n";
+        std::cout << "Build page_output_file_bytes: "
+                  << build_stats.page_output_file_bytes << "\n";
+        std::cout << "Build page_writeback_ms: "
+                  << (build_stats.page_writeback_ns / 1000000.0) << "\n";
+        std::cout << "Build page_writeback_bytes: " << build_stats.page_writeback_bytes << "\n";
+        std::cout << "Build page_writeback_calls: " << build_stats.page_writeback_calls << "\n";
+        std::cout << "Build result_buffer_limit_bytes: "
+                  << build_stats.build_result_buffer_limit_bytes << "\n";
+        std::cout << "Build result_buffer_peak_bytes: "
+                  << build_stats.build_result_buffer_peak_bytes << "\n";
+        std::cout << "Build result_buffer_wait_ms: "
+                  << (build_stats.build_result_buffer_wait_ns / 1000000.0) << "\n";
         std::cout << "Build page_close_ms: "
                   << (build_stats.page_close_ns / 1000000.0) << "\n";
         std::cout << "Build index_write_ms: " << (build_stats.index_write_ns / 1000000.0) << "\n";
@@ -640,26 +1133,48 @@ int main(int argc, char** argv) {
 
     uint64_t memory_bytes = memory_mb == 0 ? 0 : memory_mb * 1024ULL * 1024ULL;
     uint64_t prefetch_bytes = prefetch_mb * 1024ULL * 1024ULL;
-    PagedProteinAAStore store;
-    auto open_start = std::chrono::high_resolution_clock::now();
-    if (!store.open(store_dir, memory_bytes)) {
-        std::cerr << "Error: failed to open paged store: " << store_dir << "\n";
-        return 1;
-    }
-    store.set_prefetch_depth(static_cast<size_t>(prefetch_depth));
+    PagedProteinAAStore::Options store_options;
+    store_options.memory_bytes = memory_bytes;
+    store_options.prefetch_bytes = prefetch_bytes;
+    store_options.io_threads = static_cast<size_t>(effective_prefetch_threads);
+    store_options.decode_threads = static_cast<size_t>(decode_threads);
+    store_options.preload_threads = static_cast<size_t>(preload_threads);
+    store_options.prefetch_depth = static_cast<size_t>(prefetch_depth);
+    store_options.uring_sqpoll = uring_sqpoll;
+    store_options.caller_runs_async_io = caller_only_io;
+    store_options.aio_completion_batch =
+        static_cast<size_t>(single_thread_aio_completions);
+    store_options.aio_completion_min = static_cast<size_t>(aio_completion_min);
+    store_options.auto_preload = false;
+    const bool get_by_name_mode = *get && get_name_option->count() != 0;
+    store_options.load_names = load_names || get_by_name_mode || bench_by_name;
+    store_options.names_path = get_by_name_mode ? get_names_path : bench_names_path;
     try {
-        store.set_prefetch_io_backend(io_backend);
+        store_options.io_backend =
+            PagedProteinAAStore::parse_prefetch_io_backend(io_backend);
+        store_options.cache_policy =
+            PagedProteinAAStore::parse_resident_cache_policy(cache_policy);
     } catch (const std::exception& exc) {
         std::cerr << "Error: " << exc.what() << "\n";
         return 1;
     }
-    store.set_uring_sqpoll(uring_sqpoll);
-    store.set_resident_cache_policy(cache_policy);
-    store.set_io_threads(static_cast<size_t>(effective_prefetch_threads));
-    store.set_prefetch_memory_bytes(prefetch_bytes);
-    store.set_single_thread_aio(caller_only_io);
-    store.set_single_thread_aio_completion_batch(static_cast<size_t>(single_thread_aio_completions));
-    store.set_aio_completion_min(static_cast<size_t>(aio_completion_min));
+
+    PagedProteinAAStore store;
+    auto open_start = std::chrono::high_resolution_clock::now();
+    if (!store.open(store_dir, store_options.memory_bytes)) {
+        std::cerr << "Error: failed to open paged store: " << store_dir << "\n";
+        return 1;
+    }
+    store.configure(store_options);
+    if (store_options.load_names) {
+        const std::string names_path = store_options.names_path.empty()
+            ? (std::filesystem::path(store_dir) / "seq_names.txt").string()
+            : store_options.names_path;
+        if (!store.load_names(names_path)) {
+            std::cerr << "Error: failed to load sequence names: " << names_path << "\n";
+            return 1;
+        }
+    }
     auto open_end = std::chrono::high_resolution_clock::now();
     auto open_ms = std::chrono::duration_cast<std::chrono::milliseconds>(open_end - open_start).count();
     PagedProteinAAStore::MemoryBreakdown open_mem = store.memory_breakdown();
@@ -700,11 +1215,20 @@ int main(int argc, char** argv) {
     }
 
     if (*get) {
-        std::cout << store.get(static_cast<size_t>(seq_id)) << "\n";
+        if (get_by_name_mode) {
+            std::cout << store.get_by_name(seq_name) << "\n";
+        } else {
+            std::cout << store.get(static_cast<size_t>(seq_id)) << "\n";
+        }
         return 0;
     }
 
     std::vector<size_t> ids = make_random_ids(store.size(), samples, seed);
+    std::vector<std::string_view> names;
+    if (bench_by_name) {
+        names.reserve(ids.size());
+        for (size_t id : ids) names.push_back(store.name(id));
+    }
 
     store.reset_stats();
     uint64_t checksum = 0;
@@ -742,9 +1266,15 @@ int main(int argc, char** argv) {
             auto get_start = std::chrono::high_resolution_clock::now();
             std::vector<std::string> seqs;
             if (batch_into_mode) {
-                store.batch_get_into(ids, output_ptrs);
+                if (bench_by_name) {
+                    store.batch_get_by_name_into(names, output_ptrs);
+                } else {
+                    store.batch_get_into(ids, output_ptrs);
+                }
             } else {
-                seqs = store.batch_get(ids);
+                seqs = bench_by_name
+                    ? store.batch_get_by_name(names)
+                    : store.batch_get(ids);
             }
             auto get_end = std::chrono::high_resolution_clock::now();
             const auto round_get_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -766,8 +1296,10 @@ int main(int argc, char** argv) {
             round_checksum_ns.push_back(round_checksum);
         } else {
             auto get_start = std::chrono::high_resolution_clock::now();
-            for (size_t id : ids) {
-                std::string seq = store.get(id);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                std::string seq = bench_by_name
+                    ? store.get_by_name(names[i])
+                    : store.get(ids[i]);
                 total_chars += seq.size();
                 for (unsigned char c : seq) checksum += c;
             }
@@ -806,6 +1338,7 @@ int main(int argc, char** argv) {
     std::cout << "backend=paged_aastore\n";
     std::cout << "strategy=" << strategy << "\n";
     std::cout << "output_mode=" << (batch_into_mode ? "batch_into" : "strings") << "\n";
+    std::cout << "lookup_mode=" << (bench_by_name ? "name" : "id") << "\n";
     std::cout << "store_size=" << store.size() << "\n";
     std::cout << "total_length=" << store.total_length() << "\n";
     std::cout << "page_residues=" << store.page_residues() << "\n";
@@ -816,6 +1349,7 @@ int main(int argc, char** argv) {
               << "\n";
     std::cout << "memory_mb=" << memory_mb << "\n";
     std::cout << "cache_policy=" << store.resident_cache_policy_name() << "\n";
+    std::cout << "names_loaded=" << (store.names_loaded() ? 1 : 0) << "\n";
     std::cout << "samples=" << samples << "\n";
     std::cout << "rounds=" << benchmark_rounds << "\n";
     std::cout << "output_prepare_ms=" << (output_prepare_ns.count() / 1000000.0) << "\n";
@@ -834,6 +1368,7 @@ int main(int argc, char** argv) {
     std::cout << "prefetch_mb=" << prefetch_mb << "\n";
     std::cout << "prefetch_effective_mb=" << (store.prefetch_memory_bytes() / (1024ULL * 1024ULL)) << "\n";
     std::cout << "prefetch_threads=" << (use_batch_access && prefetch_mb > 0 ? store.io_threads() : 0) << "\n";
+    std::cout << "decode_threads=" << stats.full_cache_decode_threads << "\n";
     std::cout << "prefetch_depth=" << (use_batch_access && prefetch_mb > 0 ? stats.prefetch_depth : 1) << "\n";
     std::cout << "prefetch_io=" << PagedProteinAAStore::prefetch_io_backend_name(
         use_batch_access && prefetch_mb > 0
@@ -925,6 +1460,10 @@ int main(int argc, char** argv) {
     std::cout << "memory_page_cache_lru_est_bytes=" << mem.page_cache_lru_est_bytes << "\n";
     std::cout << "memory_page_cache_admission_bytes=" << mem.page_cache_admission_bytes << "\n";
     std::cout << "memory_prefetch_window_est_bytes=" << prefetch_window_est_bytes << "\n";
+    std::cout << "memory_names_blob_bytes=" << mem.names_blob_bytes << "\n";
+    std::cout << "memory_names_offsets_bytes=" << mem.names_offsets_bytes << "\n";
+    std::cout << "memory_names_hash_slots=" << mem.names_hash_slots << "\n";
+    std::cout << "memory_names_hash_est_bytes=" << mem.names_hash_est_bytes << "\n";
     std::cout << "memory_path_string_bytes=" << mem.path_string_bytes << "\n";
     std::cout << "memory_total_resident_est_bytes=" << mem.total_resident_est_bytes << "\n";
     std::cout << "disk_meta_bytes=" << mem.disk_meta_bytes << "\n";

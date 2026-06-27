@@ -67,6 +67,46 @@ public:
         Prefix = 1
     };
 
+    enum class BuildIoPolicy : uint8_t {
+        Balanced = 0,
+        ReadFirst = 1
+    };
+
+    struct Options {
+        // 0 means use enough resident cache capacity for all pages.
+        uint64_t memory_bytes = 0;
+
+        // Temporary miss-page buffer for batch prefetch. 0 disables prefetch.
+        uint64_t prefetch_bytes = 16ULL * 1024ULL * 1024ULL;
+
+        // Half-memory random access: total I/O streams, including the caller.
+        size_t io_threads = 2;
+
+        // Full-memory batch_get_into: decode/access worker threads.
+        size_t decode_threads = 1;
+
+        // 0 means auto.
+        size_t preload_threads = 0;
+        size_t prefetch_depth = 0;
+
+        PrefetchIoBackend io_backend = PrefetchIoBackend::Auto;
+        ResidentCachePolicy cache_policy = ResidentCachePolicy::Lru;
+
+        bool auto_preload = true;
+        bool uring_sqpoll = false;
+        bool caller_runs_async_io = false;
+
+        size_t aio_completion_batch = 64;
+        size_t aio_completion_min = 4;
+
+        bool load_names = false;
+        std::string names_path;
+
+        static constexpr uint64_t mib(uint64_t value) {
+            return value * 1024ULL * 1024ULL;
+        }
+    };
+
     PagedProteinAAStore() = default;
     PagedProteinAAStore(const PagedProteinAAStore&) = delete;
     PagedProteinAAStore& operator=(const PagedProteinAAStore&) = delete;
@@ -116,6 +156,7 @@ public:
         uint64_t prefetch_miss_scan_ns = 0;
         uint64_t prefetch_range_build_ns = 0;
         uint64_t prefetch_setup_ns = 0;
+        uint64_t full_cache_decode_threads = 1;
     };
 
     struct MemoryBreakdown {
@@ -137,6 +178,10 @@ public:
         uint64_t page_cache_lru_est_bytes = 0;
         uint64_t page_cache_admission_bytes = 0;
         uint64_t path_string_bytes = 0;
+        uint64_t names_blob_bytes = 0;
+        uint64_t names_offsets_bytes = 0;
+        uint64_t names_hash_slots = 0;
+        uint64_t names_hash_est_bytes = 0;
         uint64_t total_resident_est_bytes = 0;
         uint64_t disk_meta_bytes = 0;
         uint64_t disk_pages_bytes = 0;
@@ -171,7 +216,8 @@ public:
         uint64_t task_id = 0;
         uint64_t page_residues = 0;
         EncodingMode encoding_mode = EncodingMode::StopAware;
-        std::vector<char> raw;
+        std::unique_ptr<char[]> raw;
+        size_t raw_size = 0;
     };
 
     struct BuildTaskResult {
@@ -186,17 +232,42 @@ public:
         uint64_t enqueue_wait_ns = 0;
         uint64_t pack_ns = 0;
         uint64_t write_ns = 0;
+        uint64_t page_writeback_ns = 0;
         uint64_t page_close_ns = 0;
         uint64_t index_write_ns = 0;
         uint64_t drain_ns = 0;
         uint64_t finalize_ns = 0;
+        uint64_t page_write_buffer_bytes = 0;
+        uint64_t page_writeback_step_bytes = 0;
+        uint64_t page_output_direct = 0;
+        uint64_t page_output_file_bytes = 0;
         uint64_t raw_bytes = 0;
         uint64_t packed_bytes = 0;
+        uint64_t page_writeback_bytes = 0;
+        uint64_t page_writeback_calls = 0;
+        uint64_t build_result_buffer_limit_bytes = 0;
+        uint64_t build_result_buffer_peak_bytes = 0;
+        uint64_t build_result_buffer_wait_ns = 0;
         uint64_t index_bytes = 0;
         uint64_t index_flushes = 0;
         uint64_t index_buffer_bytes = 0;
         uint64_t pages = 0;
         uint64_t tasks = 0;
+    };
+
+    static constexpr uint64_t default_build_write_buffer_bytes() {
+        return 4ULL * 1024ULL * 1024ULL;
+    }
+
+    struct NameIndexStats {
+        uint64_t read_ns = 0;
+        uint64_t scan_offsets_ns = 0;
+        uint64_t build_hash_ns = 0;
+        uint64_t write_ns = 0;
+        uint64_t names_bytes = 0;
+        uint64_t names = 0;
+        uint64_t hash_slots = 0;
+        uint64_t index_bytes = 0;
     };
 
     class StreamingMetaWriter {
@@ -348,12 +419,40 @@ public:
     class BufferedPageWriter {
     public:
         static constexpr size_t default_buffer_bytes = 4ULL * 1024ULL * 1024ULL;
+        static constexpr uint64_t default_writeback_step_bytes =
+            512ULL * 1024ULL * 1024ULL;
 
         explicit BufferedPageWriter(const std::string& path,
-                                    size_t buffer_bytes = default_buffer_bytes)
-            : buffer_limit_bytes_(std::max<size_t>(1, buffer_bytes)) {
-            buffer_.reserve(buffer_limit_bytes_);
-            fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                                    size_t buffer_bytes = default_buffer_bytes,
+                                    uint64_t writeback_step_bytes =
+                                        default_writeback_step_bytes,
+                                    bool direct_output = false)
+            : buffer_limit_bytes_(std::max<size_t>(1, buffer_bytes)),
+              writeback_step_bytes_(writeback_step_bytes),
+              direct_output_(direct_output) {
+            if (direct_output_) {
+                buffer_limit_bytes_ = align_up(
+                    std::max<size_t>(direct_alignment_, buffer_limit_bytes_),
+                    direct_alignment_);
+                void* ptr = nullptr;
+                if (::posix_memalign(&ptr, direct_alignment_, buffer_limit_bytes_) != 0) {
+                    failed_ = true;
+                    return;
+                }
+                direct_buffer_.reset(static_cast<uint8_t*>(ptr));
+            } else {
+                buffer_.reserve(buffer_limit_bytes_);
+            }
+            int flags = O_WRONLY | O_CREAT | O_TRUNC;
+#if defined(O_DIRECT)
+            if (direct_output_) flags |= O_DIRECT;
+#endif
+            fd_ = ::open(path.c_str(), flags, 0666);
+#if defined(POSIX_FADV_SEQUENTIAL)
+            if (fd_ >= 0) {
+                (void)::posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+            }
+#endif
         }
 
         BufferedPageWriter(const BufferedPageWriter&) = delete;
@@ -369,6 +468,7 @@ public:
 
         bool append(const uint8_t* data, size_t len) {
             if (!good() || (data == nullptr && len != 0)) return false;
+            if (direct_output_) return append_direct(data, len);
             size_t copied = 0;
             while (copied < len) {
                 if (buffer_.empty() && len - copied >= buffer_limit_bytes_) {
@@ -386,6 +486,7 @@ public:
 
         bool flush() {
             if (!good()) return false;
+            if (direct_output_) return flush_direct();
             if (buffer_.empty()) return true;
             if (!write_chunk(buffer_.data(), buffer_.size())) return false;
             buffer_.clear();
@@ -395,6 +496,7 @@ public:
         bool close() {
             if (fd_ < 0) return !failed_;
             if (!flush()) return false;
+            issue_background_writeback(true);
             auto close_start = std::chrono::steady_clock::now();
             const int close_result = ::close(fd_);
             close_ns_ += static_cast<uint64_t>(
@@ -409,10 +511,65 @@ public:
         }
 
         uint64_t write_ns() const { return write_ns_; }
+        uint64_t writeback_ns() const { return writeback_ns_; }
+        uint64_t writeback_bytes() const { return writeback_bytes_; }
+        uint64_t writeback_calls() const { return writeback_calls_; }
         uint64_t close_ns() const { return close_ns_; }
+        uint64_t buffer_bytes() const {
+            return static_cast<uint64_t>(buffer_limit_bytes_);
+        }
+        uint64_t writeback_step_bytes() const { return writeback_step_bytes_; }
+        bool direct_output() const { return direct_output_; }
+        uint64_t file_bytes_written() const { return bytes_written_; }
 
     private:
+        struct FreeDeleter {
+            void operator()(uint8_t* ptr) const {
+                std::free(ptr);
+            }
+        };
+
+        static constexpr size_t direct_alignment_ = 4096;
+
+        static size_t align_up(size_t value, size_t alignment) {
+            return ((value + alignment - 1) / alignment) * alignment;
+        }
+
+        bool append_direct(const uint8_t* data, size_t len) {
+            size_t copied = 0;
+            while (copied < len) {
+                size_t space = buffer_limit_bytes_ - direct_buffer_size_;
+                size_t take = std::min(space, len - copied);
+                std::memcpy(direct_buffer_.get() + direct_buffer_size_,
+                            data + copied, take);
+                direct_buffer_size_ += take;
+                copied += take;
+                if (direct_buffer_size_ == buffer_limit_bytes_ && !flush_direct()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool flush_direct() {
+            if (direct_buffer_size_ == 0) return true;
+            size_t write_bytes = direct_buffer_size_;
+            size_t padded_bytes = align_up(write_bytes, direct_alignment_);
+            if (padded_bytes > buffer_limit_bytes_) {
+                failed_ = true;
+                return false;
+            }
+            if (padded_bytes != write_bytes) {
+                std::memset(direct_buffer_.get() + write_bytes, 0,
+                            padded_bytes - write_bytes);
+            }
+            if (!write_chunk(direct_buffer_.get(), padded_bytes)) return false;
+            direct_buffer_size_ = 0;
+            return true;
+        }
+
         bool write_chunk(const uint8_t* data, size_t len) {
+            const uint64_t chunk_offset = bytes_written_;
             size_t written = 0;
             auto write_start = std::chrono::steady_clock::now();
             while (written < len) {
@@ -423,18 +580,63 @@ public:
                 }
                 written += static_cast<size_t>(result);
             }
+            bytes_written_ = chunk_offset + static_cast<uint64_t>(written);
             write_ns_ += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - write_start).count());
+            issue_background_writeback(false);
             return true;
+        }
+
+        void issue_background_writeback(bool force) {
+#if defined(__linux__) && defined(SYS_sync_file_range)
+#ifndef SYNC_FILE_RANGE_WRITE
+#define SYNC_FILE_RANGE_WRITE 2
+#endif
+            if (fd_ < 0 || writeback_disabled_) return;
+            if (direct_output_) return;
+            if (writeback_step_bytes_ == 0) return;
+            const uint64_t pending = bytes_written_ - writeback_submitted_until_;
+            if (pending == 0) return;
+            if (!force && pending < writeback_step_bytes_) return;
+            auto start = std::chrono::steady_clock::now();
+            const long rc = ::syscall(SYS_sync_file_range, fd_,
+                                      static_cast<off_t>(writeback_submitted_until_),
+                                      static_cast<off_t>(pending),
+                                      SYNC_FILE_RANGE_WRITE);
+            writeback_ns_ += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count());
+            if (rc == 0) {
+                writeback_submitted_until_ = bytes_written_;
+                writeback_bytes_ += pending;
+                ++writeback_calls_;
+                return;
+            }
+            if (errno == ENOSYS || errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+                writeback_disabled_ = true;
+            }
+#else
+            (void)force;
+#endif
         }
 
         int fd_ = -1;
         std::vector<uint8_t> buffer_;
+        std::unique_ptr<uint8_t, FreeDeleter> direct_buffer_;
         size_t buffer_limit_bytes_ = 0;
+        size_t direct_buffer_size_ = 0;
+        uint64_t writeback_step_bytes_ = default_writeback_step_bytes;
+        uint64_t bytes_written_ = 0;
+        uint64_t writeback_submitted_until_ = 0;
         uint64_t write_ns_ = 0;
+        uint64_t writeback_ns_ = 0;
+        uint64_t writeback_bytes_ = 0;
+        uint64_t writeback_calls_ = 0;
         uint64_t close_ns_ = 0;
         bool failed_ = false;
+        bool writeback_disabled_ = false;
+        bool direct_output_ = false;
     };
 
     static bool build_from_store(const std::string& source_store_path,
@@ -556,9 +758,17 @@ public:
                                            uint64_t page_residues,
                                            ProduceStream&& produce_stream,
                                            BuildStats* stats = nullptr,
-                                           EncodingMode encoding_mode = EncodingMode::StopAware) {
+                                           EncodingMode encoding_mode = EncodingMode::StopAware,
+                                           uint64_t page_write_buffer_bytes =
+                                               BufferedPageWriter::default_buffer_bytes,
+                                           uint64_t page_writeback_step_bytes =
+                                               BufferedPageWriter::default_writeback_step_bytes,
+                                           bool direct_output = false) {
         if (stats) *stats = BuildStats{};
         if (page_residues == 0) return false;
+        if (page_write_buffer_bytes == 0) {
+            page_write_buffer_bytes = BufferedPageWriter::default_buffer_bytes;
+        }
 
         namespace fs = std::filesystem;
         fs::create_directories(output_dir);
@@ -566,7 +776,10 @@ public:
         const fs::path pages_path = out_dir / "pages.bin";
         const fs::path meta_path = out_dir / "meta.bin";
 
-        BufferedPageWriter pages_out(pages_path.string());
+        BufferedPageWriter pages_out(pages_path.string(),
+                                     static_cast<size_t>(page_write_buffer_bytes),
+                                     page_writeback_step_bytes,
+                                     direct_output);
         if (!pages_out.good()) return false;
 
         StreamingMetaWriter meta_writer(meta_path.string(),
@@ -650,6 +863,13 @@ public:
                                             page_residues, page_count);
         if (stats) {
             stats->write_ns = pages_out.write_ns();
+            stats->page_write_buffer_bytes = pages_out.buffer_bytes();
+            stats->page_writeback_step_bytes = pages_out.writeback_step_bytes();
+            stats->page_output_direct = pages_out.direct_output() ? 1 : 0;
+            stats->page_output_file_bytes = pages_out.file_bytes_written();
+            stats->page_writeback_ns = pages_out.writeback_ns();
+            stats->page_writeback_bytes = pages_out.writeback_bytes();
+            stats->page_writeback_calls = pages_out.writeback_calls();
             stats->page_close_ns = pages_out.close_ns();
             stats->index_write_ns = meta_writer.write_ns();
             stats->index_bytes = meta_writer.bytes_written();
@@ -748,10 +968,25 @@ public:
                                                     ProduceStream&& produce_stream,
                                                     size_t thread_count,
                                                     BuildStats* stats = nullptr,
-                                                    EncodingMode encoding_mode = EncodingMode::StopAware) {
+                                                    EncodingMode encoding_mode = EncodingMode::StopAware,
+                                                    BuildIoPolicy io_policy = BuildIoPolicy::Balanced,
+                                                    uint64_t write_buffer_limit_bytes =
+                                                        default_build_write_buffer_bytes(),
+                                                    uint64_t page_write_buffer_bytes =
+                                                        BufferedPageWriter::default_buffer_bytes,
+                                                    uint64_t page_writeback_step_bytes =
+                                                        BufferedPageWriter::default_writeback_step_bytes,
+                                                    bool direct_output = false) {
         if (stats) *stats = BuildStats{};
-        if (thread_count <= 1) return false;
+        if (thread_count == 0) return false;
         if (page_residues == 0) return false;
+        const bool read_first_io = io_policy == BuildIoPolicy::ReadFirst;
+        if (write_buffer_limit_bytes == 0) {
+            write_buffer_limit_bytes = default_build_write_buffer_bytes();
+        }
+        if (page_write_buffer_bytes == 0) {
+            page_write_buffer_bytes = BufferedPageWriter::default_buffer_bytes;
+        }
 
         namespace fs = std::filesystem;
         fs::create_directories(output_dir);
@@ -759,7 +994,10 @@ public:
         const fs::path pages_path = out_dir / "pages.bin";
         const fs::path meta_path = out_dir / "meta.bin";
 
-        BufferedPageWriter pages_out(pages_path.string());
+        BufferedPageWriter pages_out(pages_path.string(),
+                                     static_cast<size_t>(page_write_buffer_bytes),
+                                     page_writeback_step_bytes,
+                                     direct_output);
         if (!pages_out.good()) return false;
         StreamingMetaWriter meta_writer(meta_path.string(),
                                         StreamingMetaWriter::default_buffer_bytes,
@@ -772,12 +1010,17 @@ public:
         std::condition_variable task_cv;
         std::condition_variable result_cv;
         std::condition_variable space_cv;
+        std::condition_variable raw_buffer_cv;
+        std::condition_variable result_space_cv;
         std::exception_ptr error = nullptr;
         bool producer_done = false;
         bool stop_workers = false;
         size_t active_tasks = 0;
         uint64_t total_tasks = 0;
+        uint64_t completed_bytes = 0;
+        uint64_t completed_peak_bytes = 0;
         std::atomic<uint64_t> pack_ns{0};
+        std::atomic<uint64_t> result_buffer_wait_ns{0};
 
         const size_t target_raw_batch_bytes = 4ULL * 1024ULL * 1024ULL;
         const size_t pages_per_task = std::max<size_t>(
@@ -787,6 +1030,12 @@ public:
             std::min<uint64_t>(
                 static_cast<uint64_t>(pages_per_task) * page_residues,
                 static_cast<uint64_t>(std::numeric_limits<size_t>::max())));
+        const size_t raw_pool_size = max_inflight_tasks + 1;
+        std::vector<std::unique_ptr<char[]>> free_raw_buffers;
+        free_raw_buffers.reserve(raw_pool_size);
+        for (size_t i = 0; i < raw_pool_size; ++i) {
+            free_raw_buffers.emplace_back(new char[task_raw_capacity]);
+        }
 
         auto set_error = [&](std::exception_ptr ex) {
             std::lock_guard<std::mutex> lock(mutex);
@@ -795,8 +1044,29 @@ public:
             producer_done = true;
         };
 
+        auto acquire_raw_buffer = [&]() -> std::unique_ptr<char[]> {
+            std::unique_lock<std::mutex> lock(mutex);
+            raw_buffer_cv.wait(lock, [&]() {
+                return error || !free_raw_buffers.empty();
+            });
+            if (error) return nullptr;
+            std::unique_ptr<char[]> buffer = std::move(free_raw_buffers.back());
+            free_raw_buffers.pop_back();
+            return buffer;
+        };
+
+        auto release_raw_buffer = [&](std::unique_ptr<char[]> buffer) {
+            if (!buffer) return;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                free_raw_buffers.push_back(std::move(buffer));
+            }
+            raw_buffer_cv.notify_one();
+        };
+
         auto inflight_locked = [&]() -> size_t {
-            return task_queue.size() + active_tasks + completed.size();
+            return task_queue.size() + active_tasks +
+                   (read_first_io ? size_t{0} : completed.size());
         };
 
         auto enqueue_task = [&](BuildTask&& task) -> bool {
@@ -840,14 +1110,40 @@ public:
 
                     try {
                         auto pack_start = std::chrono::steady_clock::now();
-                        BuildTaskResult result = pack_build_task(std::move(task));
+                        BuildTaskResult result = pack_build_task(task);
+                        std::unique_ptr<char[]> raw_buffer = std::move(task.raw);
                         pack_ns.fetch_add(static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - pack_start).count()),
                             std::memory_order_relaxed);
+                        release_raw_buffer(std::move(raw_buffer));
                         {
-                            std::lock_guard<std::mutex> lock(mutex);
+                            auto result_wait_start = std::chrono::steady_clock::now();
+                            std::unique_lock<std::mutex> lock(mutex);
+                            if (read_first_io && !result.packed_block.empty()) {
+                                const uint64_t result_bytes =
+                                    static_cast<uint64_t>(result.packed_block.size());
+                                result_space_cv.wait(lock, [&]() {
+                                    return error ||
+                                           completed_bytes + result_bytes <= write_buffer_limit_bytes ||
+                                           completed.empty();
+                                });
+                            }
+                            if (read_first_io) {
+                                result_buffer_wait_ns.fetch_add(static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - result_wait_start).count()),
+                                    std::memory_order_relaxed);
+                            }
+                            if (error) {
+                                --active_tasks;
+                                return;
+                            }
                             --active_tasks;
+                            completed_bytes +=
+                                static_cast<uint64_t>(result.packed_block.size());
+                            completed_peak_bytes =
+                                std::max(completed_peak_bytes, completed_bytes);
                             completed.emplace(result.task_id, std::move(result));
                         }
                         result_cv.notify_all();
@@ -863,6 +1159,7 @@ public:
                         task_cv.notify_all();
                         result_cv.notify_all();
                         space_cv.notify_all();
+                        raw_buffer_cv.notify_all();
                         return;
                     }
                 }
@@ -871,14 +1168,26 @@ public:
 
         std::thread writer([&]() {
             uint64_t next_task_to_write = 0;
+            const uint64_t high_water_bytes =
+                write_buffer_limit_bytes - write_buffer_limit_bytes / 8;
+            const uint64_t low_water_bytes =
+                write_buffer_limit_bytes - write_buffer_limit_bytes / 4;
             try {
                 while (true) {
                     BuildTaskResult result;
                     {
                         std::unique_lock<std::mutex> lock(mutex);
                         result_cv.wait(lock, [&]() {
-                            return error ||
-                                   completed.find(next_task_to_write) != completed.end() ||
+                            if (error) return true;
+                            if (producer_done && next_task_to_write == total_tasks) {
+                                return true;
+                            }
+                            const bool next_ready =
+                                completed.find(next_task_to_write) != completed.end();
+                            if (!next_ready) return false;
+                            if (!read_first_io) return true;
+                            return producer_done ||
+                                   completed_bytes >= high_water_bytes ||
                                    (producer_done && next_task_to_write == total_tasks);
                         });
                         if (error) return;
@@ -887,9 +1196,12 @@ public:
                         auto it = completed.find(next_task_to_write);
                         if (it == completed.end()) continue;
                         result = std::move(it->second);
+                        completed_bytes -=
+                            static_cast<uint64_t>(result.packed_block.size());
                         completed.erase(it);
                     }
                     space_cv.notify_all();
+                    result_space_cv.notify_all();
 
                     if (!result.packed_block.empty()) {
                         if (!pages_out.append(result.packed_block.data(),
@@ -898,17 +1210,26 @@ public:
                         }
                     }
                     ++next_task_to_write;
+                    if (read_first_io && !producer_done) {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        if (completed_bytes <= low_water_bytes) {
+                            continue;
+                        }
+                    }
                 }
             } catch (...) {
                 set_error(std::current_exception());
                 task_cv.notify_all();
                 result_cv.notify_all();
                 space_cv.notify_all();
+                raw_buffer_cv.notify_all();
+                result_space_cv.notify_all();
             }
         });
 
-        std::vector<char> current_task_raw;
-        current_task_raw.reserve(task_raw_capacity);
+        std::unique_ptr<char[]> current_task_raw = acquire_raw_buffer();
+        if (!current_task_raw) return false;
+        size_t current_task_size = 0;
 
         uint64_t sequence_count = 0;
         uint64_t total_length = 0;
@@ -916,17 +1237,22 @@ public:
         uint64_t next_task_id = 0;
         bool sequence_open = false;
 
-        auto flush_task = [&]() -> bool {
-            if (current_task_raw.empty()) return true;
+        auto flush_task = [&](bool acquire_next) -> bool {
+            if (current_task_size == 0) return true;
             BuildTask task;
             task.task_id = next_task_id++;
             task.page_residues = page_residues;
             task.encoding_mode = encoding_mode;
             task.raw = std::move(current_task_raw);
-            current_task_raw.clear();
-            current_task_raw.reserve(task_raw_capacity);
+            task.raw_size = current_task_size;
+            current_task_size = 0;
             if (stats) ++stats->tasks;
-            return enqueue_task(std::move(task));
+            if (!enqueue_task(std::move(task))) return false;
+            if (acquire_next) {
+                current_task_raw = acquire_raw_buffer();
+                if (!current_task_raw) return false;
+            }
+            return true;
         };
 
         auto begin_sequence = [&]() -> bool {
@@ -938,16 +1264,24 @@ public:
 
         auto append_residues = [&](const char* data, size_t len) -> bool {
             if (!sequence_open || (data == nullptr && len != 0)) return false;
-            size_t copied = 0;
-            while (copied < len) {
-                if (current_task_raw.size() == task_raw_capacity) {
-                    if (!flush_task()) return false;
+            if (len == 0) return true;
+
+            if (len <= task_raw_capacity - current_task_size) {
+                std::memcpy(current_task_raw.get() + current_task_size, data, len);
+                current_task_size += len;
+            } else {
+                size_t copied = 0;
+                while (copied < len) {
+                    if (current_task_size == task_raw_capacity) {
+                        if (!flush_task(true)) return false;
+                    }
+                    size_t space = task_raw_capacity - current_task_size;
+                    size_t take = std::min(space, len - copied);
+                    std::memcpy(current_task_raw.get() + current_task_size,
+                                data + copied, take);
+                    current_task_size += take;
+                    copied += take;
                 }
-                size_t space = task_raw_capacity - current_task_raw.size();
-                size_t take = std::min(space, len - copied);
-                current_task_raw.insert(current_task_raw.end(), data + copied,
-                                        data + copied + take);
-                copied += take;
             }
             current_sequence_length += static_cast<uint64_t>(len);
             if (stats) stats->raw_bytes += static_cast<uint64_t>(len);
@@ -967,10 +1301,11 @@ public:
         try {
             ok = produce_stream(begin_sequence, append_residues, end_sequence);
             if (sequence_open) ok = false;
-            if (ok) ok = flush_task();
+            if (ok) ok = flush_task(false);
         } catch (...) {
             set_error(std::current_exception());
             ok = false;
+            raw_buffer_cv.notify_all();
         }
         if (stats) {
             stats->producer_ns = static_cast<uint64_t>(
@@ -985,6 +1320,8 @@ public:
         task_cv.notify_all();
         result_cv.notify_all();
         space_cv.notify_all();
+        raw_buffer_cv.notify_all();
+        result_space_cv.notify_all();
 
         auto drain_start = std::chrono::steady_clock::now();
         for (std::thread& worker : workers) {
@@ -1023,6 +1360,19 @@ public:
         if (stats) {
             stats->pack_ns = pack_ns.load(std::memory_order_relaxed);
             stats->write_ns = pages_out.write_ns();
+            stats->page_write_buffer_bytes = pages_out.buffer_bytes();
+            stats->page_writeback_step_bytes = pages_out.writeback_step_bytes();
+            stats->page_output_direct = pages_out.direct_output() ? 1 : 0;
+            stats->page_output_file_bytes = pages_out.file_bytes_written();
+            stats->page_writeback_ns = pages_out.writeback_ns();
+            stats->page_writeback_bytes = pages_out.writeback_bytes();
+            stats->page_writeback_calls = pages_out.writeback_calls();
+            stats->build_result_buffer_limit_bytes =
+                read_first_io ? write_buffer_limit_bytes : 0;
+            stats->build_result_buffer_peak_bytes =
+                read_first_io ? completed_peak_bytes : 0;
+            stats->build_result_buffer_wait_ns =
+                read_first_io ? result_buffer_wait_ns.load(std::memory_order_relaxed) : 0;
             stats->page_close_ns = pages_out.close_ns();
         }
 
@@ -1046,6 +1396,25 @@ public:
         return true;
     }
 
+    bool open(const std::string& store_dir, const Options& options) {
+        if (!open(store_dir, options.memory_bytes)) return false;
+        configure(options);
+        if (options.load_names) {
+            std::string names_path = options.names_path.empty()
+                ? (std::filesystem::path(store_dir) / "seq_names.txt").string()
+                : options.names_path;
+            if (!load_names(names_path)) return false;
+        }
+        if (options.auto_preload) {
+            uint64_t preload_limit = options.memory_bytes == 0
+                ? uint64_t{0}
+                : options.memory_bytes;
+            preload_cache_parallel(preload_limit, options.preload_threads);
+            reset_stats();
+        }
+        return true;
+    }
+
     bool open(const std::string& store_dir, uint64_t cache_capacity_bytes) {
         namespace fs = std::filesystem;
         const fs::path dir(store_dir);
@@ -1053,6 +1422,7 @@ public:
         pages_path_ = (dir / "pages.bin").string();
 
         close_pages_fd();
+        clear_names();
         if (!read_meta(meta_path_)) return false;
         pages_fd_ = ::open(pages_path_.c_str(), O_RDONLY);
         if (pages_fd_ < 0) return false;
@@ -1067,6 +1437,314 @@ public:
         clear_cache();
         stats_ = CacheStats{};
         return true;
+    }
+
+    void configure(const Options& options) {
+        set_resident_cache_policy(options.cache_policy);
+        set_prefetch_depth(options.prefetch_depth);
+        set_prefetch_io_backend(options.io_backend);
+        set_uring_sqpoll(options.uring_sqpoll);
+        set_io_threads(options.io_threads);
+        set_full_cache_decode_threads(options.decode_threads);
+        set_prefetch_memory_bytes(options.prefetch_bytes);
+        set_single_thread_aio(options.caller_runs_async_io);
+        set_single_thread_aio_completion_batch(options.aio_completion_batch);
+        set_aio_completion_min(options.aio_completion_min);
+    }
+
+    bool load_names() {
+        if (pages_path_.empty()) return false;
+        return load_names((std::filesystem::path(pages_path_).parent_path() /
+                           "seq_names.txt").string());
+    }
+
+    bool load_names(const std::string& names_path) {
+        names_blob_.clear();
+        name_offsets32_.clear();
+        name_offsets64_.clear();
+        name_fingerprint_slots_.clear();
+        name_id_slots_.clear();
+        name_hash_mask_ = 0;
+
+        std::ifstream in(names_path, std::ios::binary);
+        if (!in) return false;
+        uint64_t bytes = file_size_or_zero(names_path);
+        if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            throw std::runtime_error("sequence names file is too large");
+        }
+
+        names_blob_.resize(static_cast<size_t>(bytes));
+        if (bytes != 0) {
+            in.read(names_blob_.data(), static_cast<std::streamsize>(names_blob_.size()));
+            if (!in) return false;
+        }
+
+        const std::string index_path = default_name_index_path(names_path);
+        if (load_name_index(index_path, bytes)) {
+            names_path_ = names_path;
+            return true;
+        }
+
+        std::vector<uint64_t> offsets;
+        offsets.reserve(static_cast<size_t>(n_ + 1));
+        offsets.push_back(0);
+        for (size_t i = 0; i < names_blob_.size(); ++i) {
+            if (names_blob_[i] == '\n') {
+                offsets.push_back(static_cast<uint64_t>(i + 1));
+            }
+        }
+        if (!names_blob_.empty() && names_blob_.back() != '\n') {
+            offsets.push_back(static_cast<uint64_t>(names_blob_.size()));
+        }
+        if (offsets.size() != static_cast<size_t>(n_ + 1)) {
+            clear_names();
+            return false;
+        }
+        assign_name_offsets(std::move(offsets), bytes);
+
+        if (n_ > std::numeric_limits<uint32_t>::max()) {
+            clear_names();
+            throw std::runtime_error("name index supports at most UINT32_MAX sequences");
+        }
+
+        const size_t slot_count = next_power_of_two(
+            std::max<uint64_t>(2, (n_ * 4 + 2) / 3));
+        name_fingerprint_slots_.assign(slot_count, 0);
+        name_id_slots_.assign(slot_count, invalid_name_id());
+        name_hash_mask_ = slot_count - 1;
+
+        for (size_t i = 0; i < static_cast<size_t>(n_); ++i) {
+            std::string_view name = name_view(i);
+            uint64_t hash = hash_name(name);
+            uint16_t fingerprint = name_fingerprint(hash);
+            size_t slot = static_cast<size_t>(mix_hash(hash)) & name_hash_mask_;
+            while (name_id_slots_[slot] != invalid_name_id()) {
+                if (name_fingerprint_slots_[slot] == fingerprint &&
+                    name_view(name_id_slots_[slot]) == name) {
+                    clear_names();
+                    throw std::runtime_error("duplicate sequence name: " +
+                                             std::string(name));
+                }
+                slot = (slot + 1) & name_hash_mask_;
+            }
+            name_fingerprint_slots_[slot] = fingerprint;
+            name_id_slots_[slot] = static_cast<uint32_t>(i);
+        }
+        names_path_ = names_path;
+        return true;
+    }
+
+    static std::string default_name_index_path(const std::string& names_path) {
+        namespace fs = std::filesystem;
+        fs::path path(names_path);
+        if (path.filename() == "seq_names.txt") {
+            return (path.parent_path() / "seq_names.index.bin").string();
+        }
+        return names_path + ".index.bin";
+    }
+
+    static bool build_name_index(const std::string& names_path,
+                                 const std::string& index_path,
+                                 uint64_t expected_names = 0,
+                                 NameIndexStats* stats = nullptr) {
+        if (stats) *stats = NameIndexStats{};
+        auto total_start = std::chrono::steady_clock::now();
+
+        std::ifstream in(names_path, std::ios::binary);
+        if (!in) return false;
+        uint64_t bytes = file_size_or_zero(names_path);
+        if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            throw std::runtime_error("sequence names file is too large");
+        }
+
+        auto read_start = std::chrono::steady_clock::now();
+        std::string blob;
+        blob.resize(static_cast<size_t>(bytes));
+        if (bytes != 0) {
+            in.read(blob.data(), static_cast<std::streamsize>(blob.size()));
+            if (!in) return false;
+        }
+        if (stats) {
+            stats->read_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - read_start).count());
+            stats->names_bytes = bytes;
+        }
+
+        auto scan_start = std::chrono::steady_clock::now();
+        std::vector<uint64_t> offsets;
+        if (expected_names != 0) {
+            offsets.reserve(static_cast<size_t>(expected_names + 1));
+        }
+        offsets.push_back(0);
+        for (size_t i = 0; i < blob.size(); ++i) {
+            if (blob[i] == '\n') offsets.push_back(static_cast<uint64_t>(i + 1));
+        }
+        if (!blob.empty() && blob.back() != '\n') {
+            offsets.push_back(static_cast<uint64_t>(blob.size()));
+        }
+        const uint64_t name_count = offsets.empty()
+            ? 0
+            : static_cast<uint64_t>(offsets.size() - 1);
+        if (expected_names != 0 && name_count != expected_names) return false;
+        if (name_count > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("name index supports at most UINT32_MAX sequences");
+        }
+        if (stats) {
+            stats->scan_offsets_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - scan_start).count());
+            stats->names = name_count;
+        }
+
+        auto build_start = std::chrono::steady_clock::now();
+        const size_t slot_count = next_power_of_two(
+            std::max<uint64_t>(2, (name_count * 4 + 2) / 3));
+        std::vector<uint16_t> fingerprint_slots(slot_count, 0);
+        std::vector<uint32_t> id_slots(slot_count, invalid_name_id());
+        const size_t mask = slot_count - 1;
+
+        auto view_name = [&](size_t seq_id) {
+            uint64_t begin = offsets[seq_id];
+            uint64_t end = offsets[seq_id + 1];
+            if (end > begin && blob[static_cast<size_t>(end - 1)] == '\n') --end;
+            if (end > begin && blob[static_cast<size_t>(end - 1)] == '\r') --end;
+            return std::string_view(blob.data() + static_cast<size_t>(begin),
+                                    static_cast<size_t>(end - begin));
+        };
+
+        for (size_t i = 0; i < static_cast<size_t>(name_count); ++i) {
+            std::string_view name = view_name(i);
+            uint64_t hash = hash_name(name);
+            uint16_t fingerprint = name_fingerprint(hash);
+            size_t slot = static_cast<size_t>(mix_hash(hash)) & mask;
+            while (id_slots[slot] != invalid_name_id()) {
+                if (fingerprint_slots[slot] == fingerprint &&
+                    view_name(id_slots[slot]) == name) {
+                    throw std::runtime_error("duplicate sequence name: " +
+                                             std::string(name));
+                }
+                slot = (slot + 1) & mask;
+            }
+            fingerprint_slots[slot] = fingerprint;
+            id_slots[slot] = static_cast<uint32_t>(i);
+        }
+        if (stats) {
+            stats->build_hash_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - build_start).count());
+            stats->hash_slots = static_cast<uint64_t>(slot_count);
+        }
+
+        auto write_start = std::chrono::steady_clock::now();
+        std::ofstream out(index_path, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        const bool use_offsets32 =
+            bytes <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+        const uint64_t offset_width = use_offsets32 ? 4 : 8;
+        const uint64_t header[] = {
+            kNameIndexMagic,
+            kNameIndexVersion,
+            name_count,
+            bytes,
+            static_cast<uint64_t>(slot_count),
+            offset_width
+        };
+        out.write(reinterpret_cast<const char*>(header), sizeof(header));
+        uint64_t offsets_bytes = 0;
+        if (use_offsets32) {
+            std::vector<uint32_t> offsets32;
+            offsets32.reserve(offsets.size());
+            for (uint64_t offset : offsets) {
+                offsets32.push_back(static_cast<uint32_t>(offset));
+            }
+            offsets_bytes = static_cast<uint64_t>(offsets32.size() * sizeof(uint32_t));
+            out.write(reinterpret_cast<const char*>(offsets32.data()),
+                      static_cast<std::streamsize>(offsets_bytes));
+        } else {
+            offsets_bytes = static_cast<uint64_t>(offsets.size() * sizeof(uint64_t));
+            out.write(reinterpret_cast<const char*>(offsets.data()),
+                      static_cast<std::streamsize>(offsets_bytes));
+        }
+        out.write(reinterpret_cast<const char*>(fingerprint_slots.data()),
+                  static_cast<std::streamsize>(
+                      fingerprint_slots.size() * sizeof(uint16_t)));
+        out.write(reinterpret_cast<const char*>(id_slots.data()),
+                  static_cast<std::streamsize>(id_slots.size() * sizeof(uint32_t)));
+        out.close();
+        if (!out) return false;
+
+        if (stats) {
+            stats->write_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - write_start).count());
+            stats->index_bytes = static_cast<uint64_t>(sizeof(header)) +
+                offsets_bytes +
+                static_cast<uint64_t>(fingerprint_slots.size() * sizeof(uint16_t)) +
+                static_cast<uint64_t>(id_slots.size() * sizeof(uint32_t));
+            (void)total_start;
+        }
+        return true;
+    }
+
+    void clear_names() {
+        names_blob_.clear();
+        name_offsets32_.clear();
+        name_offsets64_.clear();
+        name_fingerprint_slots_.clear();
+        name_id_slots_.clear();
+        name_hash_mask_ = 0;
+        names_path_.clear();
+    }
+
+    bool names_loaded() const {
+        return !name_offsets32_.empty() || !name_offsets64_.empty();
+    }
+
+    std::string_view name(size_t seq_id) const {
+        if (!names_loaded()) {
+            throw std::runtime_error("sequence names are not loaded");
+        }
+        if (seq_id >= n_) {
+            throw std::out_of_range("sequence index out of range");
+        }
+        return name_view(seq_id);
+    }
+
+    size_t id_of(std::string_view name) const {
+        if (!names_loaded()) {
+            throw std::runtime_error("sequence names are not loaded");
+        }
+        size_t seq_id = 0;
+        if (!find_name_id(name, seq_id)) throw std::out_of_range("sequence name not found");
+        return seq_id;
+    }
+
+    bool try_id_of(std::string_view name, size_t& seq_id) const {
+        if (!names_loaded()) return false;
+        return find_name_id(name, seq_id);
+    }
+
+    std::string get_by_name(std::string_view name) {
+        return get(id_of(name));
+    }
+
+    void get_by_name_into(std::string_view name, char* dst) {
+        get_into(id_of(name), dst);
+    }
+
+    std::vector<size_t> ids_of(const std::vector<std::string_view>& names) const {
+        return resolve_names_to_ids(names);
+    }
+
+    std::vector<std::string> batch_get_by_name(
+            const std::vector<std::string_view>& names) {
+        return batch_get(resolve_names_to_ids(names));
+    }
+
+    void batch_get_by_name_into(const std::vector<std::string_view>& names,
+                                const std::vector<char*>& outputs) {
+        batch_get_into(resolve_names_to_ids(names), outputs);
     }
 
     size_t size() const { return static_cast<size_t>(n_); }
@@ -1127,6 +1805,26 @@ public:
         return "unknown";
     }
 
+    static PrefetchIoBackend parse_prefetch_io_backend(const std::string& backend) {
+        if (backend == "auto") return PrefetchIoBackend::Auto;
+        if (backend == "pread") return PrefetchIoBackend::Pread;
+        if (backend == "aio") return PrefetchIoBackend::LinuxAio;
+        if (backend == "uring") return PrefetchIoBackend::IoUring;
+        if (backend == "uring_fixed") return PrefetchIoBackend::IoUringFixed;
+        if (backend == "uring_file") return PrefetchIoBackend::IoUringRegisteredFile;
+        throw std::invalid_argument("unknown prefetch I/O backend: " + backend);
+    }
+
+    static ResidentCachePolicy parse_resident_cache_policy(const std::string& policy) {
+        if (policy == "lru" || policy == "lru_2q_lite" || policy == "2q_lite") {
+            return ResidentCachePolicy::Lru;
+        }
+        if (policy == "prefix" || policy == "non-lru" || policy == "non_lru") {
+            return ResidentCachePolicy::Prefix;
+        }
+        throw std::invalid_argument("unknown resident cache policy: " + policy);
+    }
+
     const char* resident_cache_policy_name() const {
         return resident_cache_policy_name(resident_cache_policy_);
     }
@@ -1136,14 +1834,7 @@ public:
     }
 
     void set_resident_cache_policy(const std::string& policy) {
-        if (policy == "lru" || policy == "lru_2q_lite" || policy == "2q_lite") {
-            resident_cache_policy_ = ResidentCachePolicy::Lru;
-        } else if (policy == "prefix" || policy == "non-lru" ||
-                   policy == "non_lru") {
-            resident_cache_policy_ = ResidentCachePolicy::Prefix;
-        } else {
-            throw std::invalid_argument("unknown resident cache policy: " + policy);
-        }
+        resident_cache_policy_ = parse_resident_cache_policy(policy);
     }
 
     void reset_stats() { stats_ = CacheStats{}; }
@@ -1155,21 +1846,7 @@ public:
         prefetch_io_backend_ = backend;
     }
     void set_prefetch_io_backend(const std::string& backend) {
-        if (backend == "auto") {
-            prefetch_io_backend_ = PrefetchIoBackend::Auto;
-        } else if (backend == "pread") {
-            prefetch_io_backend_ = PrefetchIoBackend::Pread;
-        } else if (backend == "aio") {
-            prefetch_io_backend_ = PrefetchIoBackend::LinuxAio;
-        } else if (backend == "uring") {
-            prefetch_io_backend_ = PrefetchIoBackend::IoUring;
-        } else if (backend == "uring_fixed") {
-            prefetch_io_backend_ = PrefetchIoBackend::IoUringFixed;
-        } else if (backend == "uring_file") {
-            prefetch_io_backend_ = PrefetchIoBackend::IoUringRegisteredFile;
-        } else {
-            throw std::invalid_argument("unknown prefetch I/O backend: " + backend);
-        }
+        prefetch_io_backend_ = parse_prefetch_io_backend(backend);
     }
     void set_uring_sqpoll(bool enabled) {
         uring_sqpoll_ = enabled;
@@ -1179,6 +1856,12 @@ public:
     }
     size_t io_threads() const {
         return default_batch_prefetch_threads_;
+    }
+    void set_full_cache_decode_threads(size_t threads) {
+        full_cache_decode_threads_ = std::max<size_t>(1, threads);
+    }
+    size_t full_cache_decode_threads() const {
+        return full_cache_decode_threads_;
     }
     void set_prefetch_memory_bytes(uint64_t prefetch_memory_bytes) {
         default_batch_prefetch_memory_bytes_ =
@@ -1246,12 +1929,29 @@ public:
         mem.page_cache_admission_bytes = static_cast<uint64_t>(
             lru_recent_miss_epoch_.capacity() * sizeof(uint16_t));
         mem.path_string_bytes =
-            static_cast<uint64_t>(meta_path_.capacity() + pages_path_.capacity() + 2);
+            static_cast<uint64_t>(
+                meta_path_.capacity() + pages_path_.capacity() +
+                names_path_.capacity() + 3);
+        mem.names_blob_bytes =
+            static_cast<uint64_t>(names_blob_.capacity());
+        mem.names_offsets_bytes =
+            static_cast<uint64_t>(
+                name_offsets32_.capacity() * sizeof(uint32_t) +
+                name_offsets64_.capacity() * sizeof(uint64_t));
+        mem.names_hash_slots =
+            static_cast<uint64_t>(name_fingerprint_slots_.capacity());
+        mem.names_hash_est_bytes =
+            static_cast<uint64_t>(
+                                  name_fingerprint_slots_.capacity() * sizeof(uint16_t) +
+                                  name_id_slots_.capacity() * sizeof(uint32_t));
         mem.disk_meta_bytes = file_size_or_zero(meta_path_);
         mem.disk_pages_bytes = file_size_or_zero(pages_path_);
         mem.total_resident_est_bytes =
             mem.object_bytes +
             mem.start_positions_capacity_bytes +
+            mem.names_blob_bytes +
+            mem.names_offsets_bytes +
+            mem.names_hash_est_bytes +
             mem.page_cache_direct_vector_bytes +
             mem.page_cache_payload_bytes +
             mem.page_cache_hash_table_est_bytes +
@@ -1572,14 +2272,66 @@ private:
 
         if (all_pages_preloaded()) {
             auto decode_start = std::chrono::steady_clock::now();
-            for (size_t i = 0; i < seq_ids.size(); ++i) {
-                uint64_t start = 0;
-                uint64_t length = 0;
-                sequence_bounds(seq_ids[i], start, length);
-                if (length != 0 && outputs[i] == nullptr) {
-                    throw std::invalid_argument("output buffer is null");
+            const size_t requested_threads =
+                has_full_raw_cache()
+                    ? std::min(full_cache_decode_threads_, seq_ids.size())
+                    : size_t{1};
+            if (requested_threads <= 1 || seq_ids.size() < 4096) {
+                for (size_t i = 0; i < seq_ids.size(); ++i) {
+                    uint64_t start = 0;
+                    uint64_t length = 0;
+                    sequence_bounds(seq_ids[i], start, length);
+                    if (length != 0 && outputs[i] == nullptr) {
+                        throw std::invalid_argument("output buffer is null");
+                    }
+                    decode_sequence_into(outputs[i], start, length);
                 }
-                decode_sequence_into(outputs[i], start, length);
+                stats_.full_cache_decode_threads = 1;
+            } else {
+                std::vector<std::thread> workers;
+                std::vector<uint64_t> local_hits(requested_threads, 0);
+                std::exception_ptr error = nullptr;
+                std::mutex error_mutex;
+                workers.reserve(requested_threads);
+
+                const size_t chunk =
+                    (seq_ids.size() + requested_threads - 1) / requested_threads;
+                for (size_t t = 0; t < requested_threads; ++t) {
+                    const size_t begin = t * chunk;
+                    const size_t end = std::min(seq_ids.size(), begin + chunk);
+                    if (begin >= end) break;
+                    workers.emplace_back([&, t, begin, end]() {
+                        try {
+                            uint64_t hits = 0;
+                            for (size_t i = begin; i < end; ++i) {
+                                size_t seq_id = seq_ids[i];
+                                if (seq_id >= n_ ||
+                                    seq_id + 1 >= start_positions_.size()) {
+                                    throw std::out_of_range("sequence index out of range");
+                                }
+                                uint64_t start = start_positions_[seq_id];
+                                uint64_t length = start_positions_[seq_id + 1] - start;
+                                if (length != 0 && outputs[i] == nullptr) {
+                                    throw std::invalid_argument("output buffer is null");
+                                }
+                                hits += decode_full_cache_global_range_no_stats(
+                                    start, length, outputs[i]);
+                            }
+                            local_hits[t] = hits;
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(error_mutex);
+                            if (!error) error = std::current_exception();
+                        }
+                    });
+                }
+                for (std::thread& worker : workers) worker.join();
+                if (error) std::rethrow_exception(error);
+
+                uint64_t hits = 0;
+                for (uint64_t value : local_hits) hits += value;
+                stats_.hits += hits;
+                stats_.full_cache_decode_threads =
+                    static_cast<uint64_t>(workers.size());
             }
             stats_.no_prefetch_decode_ns += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1817,7 +2569,9 @@ private:
         return full_cache_pages_.data() + static_cast<size_t>(page_file_offset(page_id));
     }
 
-    void decode_full_cache_global_range(uint64_t offset, uint64_t length, char* dst) {
+    uint64_t decode_full_cache_global_range_no_stats(uint64_t offset,
+                                                     uint64_t length,
+                                                     char* dst) const {
         uint64_t done = 0;
         uint64_t touched_pages = 0;
         while (done < length) {
@@ -1837,7 +2591,11 @@ private:
             ++touched_pages;
             done += take;
         }
-        stats_.hits += touched_pages;
+        return touched_pages;
+    }
+
+    void decode_full_cache_global_range(uint64_t offset, uint64_t length, char* dst) {
+        stats_.hits += decode_full_cache_global_range_no_stats(offset, length, dst);
     }
 
     template <typename DecodeGroup>
@@ -3448,7 +4206,14 @@ private:
     bool stop_aware_encoding_ = false;
     std::string meta_path_;
     std::string pages_path_;
+    std::string names_path_;
     std::vector<uint64_t> start_positions_;
+    std::string names_blob_;
+    std::vector<uint32_t> name_offsets32_;
+    std::vector<uint64_t> name_offsets64_;
+    std::vector<uint16_t> name_fingerprint_slots_;
+    std::vector<uint32_t> name_id_slots_;
+    size_t name_hash_mask_ = 0;
     std::vector<uint8_t> full_cache_pages_;
     sdsl::int_vector<5> prefix_cache_codes_;
     AlignedBuffer prefix_cache_packed_;
@@ -3497,6 +4262,7 @@ private:
     PrefetchIoBackend prefetch_io_backend_ = PrefetchIoBackend::Auto;
     bool uring_sqpoll_ = false;
     size_t default_batch_prefetch_threads_ = 2;
+    size_t full_cache_decode_threads_ = 1;
     uint64_t default_batch_prefetch_memory_bytes_ =
         default_prefetch_memory_cap_bytes();
     ResidentCachePolicy resident_cache_policy_ = ResidentCachePolicy::Lru;
@@ -3626,14 +4392,14 @@ private:
         }
     }
 
-    static BuildTaskResult pack_build_task(BuildTask&& task) {
+    static BuildTaskResult pack_build_task(const BuildTask& task) {
         BuildTaskResult result;
         result.task_id = task.task_id;
         if (task.page_residues == 0) {
             throw std::runtime_error("build task has zero page size");
         }
 
-        const uint64_t raw_bytes = static_cast<uint64_t>(task.raw.size());
+        const uint64_t raw_bytes = static_cast<uint64_t>(task.raw_size);
         const uint64_t page_count =
             raw_bytes == 0 ? 0 : (raw_bytes + task.page_residues - 1) / task.page_residues;
         size_t total_packed_bytes = 0;
@@ -3646,15 +4412,16 @@ private:
         result.packed_block.assign(total_packed_bytes, 0);
         size_t block_offset = 0;
         size_t raw_offset = 0;
-        while (raw_offset < task.raw.size()) {
+        const char* raw_data = task.raw.get();
+        while (raw_offset < task.raw_size) {
             size_t residues = std::min<size_t>(
                 static_cast<size_t>(task.page_residues),
-                task.raw.size() - raw_offset);
+                task.raw_size - raw_offset);
             size_t page_bytes = static_cast<size_t>(
                 packed_bytes_for_residues(static_cast<uint64_t>(residues)));
             uint64_t offset = 0;
             append_ascii_5bit(result.packed_block.data() + block_offset, offset,
-                              task.raw.data() + raw_offset, residues,
+                              raw_data + raw_offset, residues,
                               task.encoding_mode);
             block_offset += page_bytes;
             raw_offset += residues;
@@ -3737,6 +4504,219 @@ private:
         for (size_t i = 1; i < start_positions_.size(); ++i) {
             if (start_positions_[i] < start_positions_[i - 1]) return false;
         }
+        return true;
+    }
+
+    void assign_name_offsets(std::vector<uint64_t>&& offsets,
+                             uint64_t names_bytes) {
+        name_offsets32_.clear();
+        name_offsets64_.clear();
+        if (names_bytes <=
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            name_offsets32_.reserve(offsets.size());
+            for (uint64_t offset : offsets) {
+                name_offsets32_.push_back(static_cast<uint32_t>(offset));
+            }
+        } else {
+            name_offsets64_ = std::move(offsets);
+        }
+    }
+
+    uint64_t name_offset(size_t index) const {
+        if (!name_offsets32_.empty()) return name_offsets32_[index];
+        return name_offsets64_[index];
+    }
+
+    std::string_view name_view(size_t seq_id) const {
+        uint64_t begin = name_offset(seq_id);
+        uint64_t end = name_offset(seq_id + 1);
+        if (end > begin && names_blob_[static_cast<size_t>(end - 1)] == '\n') {
+            --end;
+        }
+        if (end > begin && names_blob_[static_cast<size_t>(end - 1)] == '\r') {
+            --end;
+        }
+        return std::string_view(names_blob_.data() + static_cast<size_t>(begin),
+                                static_cast<size_t>(end - begin));
+    }
+
+    std::vector<size_t> resolve_names_to_ids(
+            const std::vector<std::string_view>& names) const {
+        if (!names_loaded()) {
+            throw std::runtime_error("sequence names are not loaded");
+        }
+
+        std::vector<size_t> ids(names.size());
+        const size_t requested_threads =
+            std::min(full_cache_decode_threads_, names.size());
+        if (requested_threads <= 1 || names.size() < 4096) {
+            for (size_t i = 0; i < names.size(); ++i) {
+                size_t seq_id = 0;
+                if (!find_name_id(names[i], seq_id)) {
+                    throw std::out_of_range("sequence name not found");
+                }
+                ids[i] = seq_id;
+            }
+            return ids;
+        }
+
+        std::vector<std::thread> workers;
+        std::exception_ptr error = nullptr;
+        std::mutex error_mutex;
+        workers.reserve(requested_threads);
+        const size_t chunk = (names.size() + requested_threads - 1) / requested_threads;
+
+        for (size_t t = 0; t < requested_threads; ++t) {
+            const size_t begin = t * chunk;
+            const size_t end = std::min(names.size(), begin + chunk);
+            if (begin >= end) break;
+            workers.emplace_back([&, begin, end]() {
+                try {
+                    for (size_t i = begin; i < end; ++i) {
+                        size_t seq_id = 0;
+                        if (!find_name_id(names[i], seq_id)) {
+                            throw std::out_of_range("sequence name not found");
+                        }
+                        ids[i] = seq_id;
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!error) error = std::current_exception();
+                }
+            });
+        }
+
+        for (std::thread& worker : workers) worker.join();
+        if (error) std::rethrow_exception(error);
+        return ids;
+    }
+
+    static constexpr uint32_t invalid_name_id() {
+        return std::numeric_limits<uint32_t>::max();
+    }
+
+    static constexpr uint64_t kNameIndexMagic = 0x31415844494E4141ULL;
+    static constexpr uint64_t kNameIndexVersion = 3;
+
+    static size_t next_power_of_two(uint64_t value) {
+        size_t result = 1;
+        while (result < value) {
+            if (result > std::numeric_limits<size_t>::max() / 2) {
+                throw std::runtime_error("name hash table is too large");
+            }
+            result <<= 1;
+        }
+        return result;
+    }
+
+    static uint64_t hash_name(std::string_view name) {
+        uint64_t hash = 1469598103934665603ULL;
+        for (unsigned char c : name) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+        return hash == 0 ? 1 : hash;
+    }
+
+    static uint64_t mix_hash(uint64_t value) {
+        value += 0x9E3779B97F4A7C15ULL;
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+        return value ^ (value >> 31);
+    }
+
+    static uint16_t name_fingerprint(uint64_t hash) {
+        uint64_t mixed = hash ^ (hash >> 32) ^ (hash >> 16);
+        return static_cast<uint16_t>(mixed);
+    }
+
+    bool find_name_id(std::string_view name, size_t& seq_id) const {
+        if (name_id_slots_.empty()) return false;
+        uint64_t hash = hash_name(name);
+        uint16_t fingerprint = name_fingerprint(hash);
+        size_t slot = static_cast<size_t>(mix_hash(hash)) & name_hash_mask_;
+        while (true) {
+            uint32_t candidate = name_id_slots_[slot];
+            if (candidate == invalid_name_id()) return false;
+            if (name_fingerprint_slots_[slot] == fingerprint) {
+                if (candidate != invalid_name_id() && name_view(candidate) == name) {
+                    seq_id = candidate;
+                    return true;
+                }
+            }
+            slot = (slot + 1) & name_hash_mask_;
+        }
+    }
+
+    bool load_name_index(const std::string& index_path, uint64_t names_bytes) {
+        std::ifstream in(index_path, std::ios::binary);
+        if (!in) return false;
+
+        uint64_t header[6] = {};
+        in.read(reinterpret_cast<char*>(header), sizeof(header));
+        if (!in) return false;
+        if (header[0] != kNameIndexMagic || header[1] != kNameIndexVersion) {
+            return false;
+        }
+        if (header[2] != n_ || header[3] != names_bytes) {
+            return false;
+        }
+        const uint64_t slot_count_u64 = header[4];
+        if (slot_count_u64 == 0 ||
+            (slot_count_u64 & (slot_count_u64 - 1)) != 0 ||
+            slot_count_u64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            return false;
+        }
+        const size_t slot_count = static_cast<size_t>(slot_count_u64);
+        if (n_ > static_cast<uint64_t>(std::numeric_limits<size_t>::max() - 1)) {
+            return false;
+        }
+
+        std::vector<uint16_t> fingerprint_slots(slot_count);
+        std::vector<uint32_t> id_slots(slot_count);
+
+        const uint64_t offset_width = header[5];
+        std::vector<uint32_t> offsets32;
+        std::vector<uint64_t> offsets64;
+        if (offset_width == 4) {
+            offsets32.resize(static_cast<size_t>(n_ + 1));
+            in.read(reinterpret_cast<char*>(offsets32.data()),
+                    static_cast<std::streamsize>(offsets32.size() * sizeof(uint32_t)));
+            if (!in) return false;
+        } else if (offset_width == 8) {
+            offsets64.resize(static_cast<size_t>(n_ + 1));
+            in.read(reinterpret_cast<char*>(offsets64.data()),
+                    static_cast<std::streamsize>(offsets64.size() * sizeof(uint64_t)));
+            if (!in) return false;
+        } else {
+            return false;
+        }
+        in.read(reinterpret_cast<char*>(fingerprint_slots.data()),
+                static_cast<std::streamsize>(
+                    fingerprint_slots.size() * sizeof(uint16_t)));
+        if (!in) return false;
+        in.read(reinterpret_cast<char*>(id_slots.data()),
+                static_cast<std::streamsize>(id_slots.size() * sizeof(uint32_t)));
+        if (!in) return false;
+
+        auto loaded_offset = [&](size_t index) -> uint64_t {
+            if (!offsets32.empty()) return offsets32[index];
+            return offsets64[index];
+        };
+        const size_t offset_count = static_cast<size_t>(n_ + 1);
+        if (offset_count == 0 || loaded_offset(0) != 0 ||
+            loaded_offset(offset_count - 1) != names_bytes) {
+            return false;
+        }
+        for (size_t i = 1; i < offset_count; ++i) {
+            if (loaded_offset(i) < loaded_offset(i - 1)) return false;
+        }
+
+        name_offsets32_.swap(offsets32);
+        name_offsets64_.swap(offsets64);
+        name_fingerprint_slots_.swap(fingerprint_slots);
+        name_id_slots_.swap(id_slots);
+        name_hash_mask_ = slot_count - 1;
         return true;
     }
 
