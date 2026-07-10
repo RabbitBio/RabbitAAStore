@@ -109,7 +109,8 @@ refs >= 2 / 8 / 32
 - 2Q first misses、promotions；
 - promotion page 数与估算替换字节；
 - 已 promotion page 对下一轮 page requests 和 demand residues 的覆盖率；
-- 分析 wall time 与峰值 RSS。
+- 分析 wall time 与峰值 RSS，写入独立 `.time.txt` sidecar，不进入要求
+  字节可复现的主结果文件。
 
 ## 输出
 
@@ -118,6 +119,7 @@ refs >= 2 / 8 / 32
 ```text
 page_hot_density_matrix_20260710/
   10m_uniform_fresh.txt
+  10m_uniform_fresh.time.txt
   10m_uniform_repeat.txt
   10m_hot80_20.txt
   10m_phase_shift.txt
@@ -125,6 +127,7 @@ page_hot_density_matrix_20260710/
   100m_uniform_repeat.txt
   100m_hot80_20.txt
   100m_phase_shift.txt
+  100m_phase_shift.time.txt
   summary.tsv
   README.md
 ```

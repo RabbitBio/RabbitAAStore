@@ -169,7 +169,8 @@ std::min<uint64_t>(store.page_residues(),
 - `phase_shift`：前两轮用 A，后两轮用不重叠热点池 B，均为 80/20。
 
 输出稳定 `key=value` 行，包含每轮 density 25/50/75/100、refs 2/8/32、
-first misses、promotions、估算替换字节和下一轮覆盖率。
+first misses、promotions、估算替换字节和下一轮覆盖率。主输出不包含墙钟
+时间、PID 或时间戳；性能计时由 `/usr/bin/time` 写入独立 sidecar。
 
 - [ ] **Step 4: 构建并运行小 store smoke**
 
@@ -233,7 +234,8 @@ git commit -m "Add metadata-only page-hot density analyzer"
 替换 `WORKLOAD`：
 
 ```bash
-/usr/bin/time -v /tmp/page_hot_density_matrix \
+/usr/bin/time -v -o page_hot_density_matrix_20260710/10m_WORKLOAD.time.txt \
+  /tmp/page_hot_density_matrix \
   --store /home/user_home/gaoyijie/build_eval_current/10m_store \
   --requests 1000000 --rounds 4 --workload WORKLOAD \
   --seed 20260710 \
@@ -247,7 +249,8 @@ Expected: 四个命令 exit 0。
 对四种 workload 分别运行：
 
 ```bash
-/usr/bin/time -v /tmp/page_hot_density_matrix \
+/usr/bin/time -v -o page_hot_density_matrix_20260710/100m_WORKLOAD.time.txt \
+  /tmp/page_hot_density_matrix \
   --store /home/user_home/gaoyijie/build_eval_current/100m_store \
   --requests 10000000 --rounds 4 --workload WORKLOAD \
   --seed 20260710 \
@@ -263,7 +266,7 @@ Expected: 四个命令 exit 0；两组均抽取数据库序列数的 10%。
 ```text
 dataset workload round touched_pages density25 density50 density75 density100
 refs2 refs8 refs32 first_miss50 promotions50 promoted_bytes50
-future_page_ref_coverage50 future_residue_coverage50 wall_ms peak_rss_kib
+future_page_ref_coverage50 future_residue_coverage50 wall_seconds peak_rss_kib
 ```
 
 逐行检查：
