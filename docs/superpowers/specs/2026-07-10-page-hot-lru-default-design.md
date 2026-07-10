@@ -2,12 +2,12 @@
 
 ## 目标
 
-删除大批次 LRU admission freeze，默认使用带页热度门槛的 2Q-lite。只有当前批次中请求密度足够高的 page 才进入 2Q admission，避免宽随机批次把 resident cache 冲掉，同时允许真正热点 page 被逐步替换进内存。
+删除大批次 LRU admission freeze 和普通 LRU 模式。半内存只保留 `prefix` 与 `page_hot_lru` 两种 canonical 策略。`page_hot_lru` 使用带页热度门槛的 2Q-lite：只有当前批次中请求密度足够高的 page 才进入 2Q admission，避免宽随机批次把 resident cache 冲掉，同时允许真正热点 page 被逐步替换进内存。
 
 ## 默认行为
 
-- `PagedProteinAAStore::Options::page_hot_lru` 默认改为 `true`。
 - 默认阈值保持 `page_hot_lru_min_refs = 32`。
+- `ResidentCachePolicy::Lru` 改为 canonical 的 `ResidentCachePolicy::PageHotLru`。
 - LRU page 必须同时满足以下条件才能 admission：
   1. 当前批次对该 page 的引用数不少于 32；
   2. 通过现有 2Q-lite 的二次访问 admission 判断。
@@ -25,22 +25,24 @@
 - `lru_admission_frozen_batches/pages` 统计及 CLI 输出；
 - range builder 中的 `freeze_lru_admissions` 判断。
 
-删除后，page-hot filter 成为控制宽批次 admission 的唯一批内门槛，2Q-lite 继续控制跨批次的二次访问。
+删除后，page-hot filter 成为控制宽批次 admission 的唯一批内门槛，2Q-lite 继续控制跨批次的二次访问。运行时不再存在关闭 page-hot filter 的普通 LRU 分支。
 
 ## CLI
 
-- benchmark 默认报告 `page_hot_lru=1`。
-- 使用成对开关：`--page-hot-lru` / `--no-page-hot-lru`。
-- `--page-hot-lru-min-refs N` 保持可配置。
-- 显式使用 `--no-page-hot-lru` 时，调用者选择普通 2Q-lite，并自行承担宽批次 churn 风险。
+- `--cache-policy` 只公开 `prefix` 和 `page_hot_lru`。
+- 旧名称 `lru`、`lru_2q_lite`、`2q_lite` 作为兼容别名解析到 `page_hot_lru`。
+- 策略名称输出统一报告 `page_hot_lru`，即使输入使用旧别名。
+- 删除 `--page-hot-lru` / `--no-page-hot-lru` 开关。
+- `--page-hot-lru-min-refs N` 保持可配置，默认 32。
 
 ## 测试
 
-1. 默认 `Options` 必须启用 page-hot LRU，阈值为 32。
-2. 高阈值下，低密度 miss page 必须被 filter，不能产生 admission 或 eviction。
-3. 满足热度阈值的 page 仍必须进入现有 2Q-lite 判断，并能在重复访问后 admission。
-4. `prefix`、no-memory、full-memory 和序列结果正确性回归必须通过。
-5. 在 10M store、1M 固定随机请求、1072 MiB resident cache 下复测 LRU；确认不再出现 freeze 统计，且结果 checksum 与 prefix/no-memory 一致。
+1. 默认 resident cache policy 必须为 `page_hot_lru`，阈值为 32。
+2. `lru`、`lru_2q_lite`、`2q_lite` 必须解析为 `page_hot_lru`，canonical 名称必须输出 `page_hot_lru`。
+3. 高阈值下，低密度 miss page 必须被 filter，不能产生 admission 或 eviction。
+4. 满足热度阈值的 page 仍必须进入现有 2Q-lite 判断，并能在重复访问后 admission。
+5. `prefix`、no-memory、full-memory 和序列结果正确性回归必须通过。
+6. 在 10M store、1M 固定随机请求、1072 MiB resident cache 下复测 `page_hot_lru`；确认不再存在 freeze 统计，且结果 checksum 与 prefix/no-memory 一致。
 
 ## 性能预期
 
