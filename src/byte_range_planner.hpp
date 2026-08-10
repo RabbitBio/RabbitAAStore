@@ -52,7 +52,9 @@ bool operator!=(const NoInitAllocator<T>&,
 
 struct SequenceRequest {
     uint64_t sequence_id;
-    size_t output_index;
+    // Original request index during preparation; direct arena byte offset
+    // after the physical output layout is built.
+    size_t output_position;
     uint64_t start;
     uint64_t length;
 };
@@ -76,7 +78,8 @@ struct ReadPlan {
 };
 
 void sort_requests_by_sequence_id(SequenceRequests& requests,
-                                  size_t thread_count);
+                                  size_t thread_count,
+                                  uint64_t sequence_count);
 
 ReadPlan plan_byte_ranges(const SequenceRequests& sorted_requests,
                           uint64_t page_residues,

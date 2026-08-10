@@ -227,7 +227,7 @@ public:
 
         const auto sort_start = Clock::now();
         if (!options.input_sorted) {
-            detail::sort_requests_by_sequence_id(requests, io_threads);
+            detail::sort_requests_by_sequence_id(requests, io_threads, size());
         }
         batch.stats.sort_ns = elapsed_ns(sort_start);
 
@@ -258,8 +258,10 @@ public:
             const size_t end = requests.size() * (worker + 1) / prepare_workers;
             uint64_t output_offset = physical_bases[worker];
             for (size_t i = begin; i < end; ++i) {
-                const detail::SequenceRequest& request = requests[i];
-                batch.offsets[request.output_index] = output_offset;
+                detail::SequenceRequest& request = requests[i];
+                const size_t original_index = request.output_position;
+                batch.offsets[original_index] = output_offset;
+                request.output_position = static_cast<size_t>(output_offset);
                 if (request.length == 0) {
                     batch.storage[static_cast<size_t>(output_offset)] = '\0';
                 }
@@ -301,8 +303,7 @@ public:
 
         auto run_worker = [&](size_t worker) {
             try {
-                std::unique_ptr<uint8_t[]> buffer;
-                size_t buffer_capacity = 0;
+                std::vector<uint8_t, detail::NoInitAllocator<uint8_t>> buffer;
                 while (true) {
                     const size_t range_index =
                         next_range.fetch_add(1, std::memory_order_relaxed);
@@ -315,18 +316,15 @@ public:
                             "packed byte range exceeds address space");
                     }
                     const size_t needed = static_cast<size_t>(range_bytes);
-                    if (needed > buffer_capacity) {
-                        buffer = std::make_unique<uint8_t[]>(needed);
-                        buffer_capacity = needed;
-                    }
+                    if (needed > buffer.size()) buffer.resize(needed);
 
                     const auto read_start = Clock::now();
                     if (parallel_single_range) {
                         pread_exact_parallel(
-                            pages_descriptor_, buffer.get(), range_bytes,
+                            pages_descriptor_, buffer.data(), range_bytes,
                             range.begin, io_threads);
                     } else {
-                        pread_exact(pages_descriptor_, buffer.get(),
+                        pread_exact(pages_descriptor_, buffer.data(),
                                     range_bytes, range.begin);
                     }
                     worker_stats[worker].read_ns += elapsed_ns(read_start);
@@ -336,7 +334,7 @@ public:
                             requests[request_index];
                         if (request.length == 0) return;
                         char* output = batch.storage.data() +
-                            batch.offsets[request.output_index];
+                            request.output_position;
                         uint64_t remaining = request.length;
                         uint64_t source = request.start;
                         uint64_t output_offset = 0;
@@ -363,7 +361,7 @@ public:
                                     "decode extent escaped merged range");
                             }
                             detail::decode_packed_5bit_range(
-                                buffer.get() + static_cast<size_t>(
+                                buffer.data() + static_cast<size_t>(
                                     decode_base - range.begin),
                                 page_offset - aligned_residue, take,
                                 output + output_offset);

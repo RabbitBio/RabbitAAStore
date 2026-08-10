@@ -41,14 +41,10 @@ PackedByteExtent packed_byte_extent(const SequenceRequest& request,
 }  // namespace
 
 void sort_requests_by_sequence_id(SequenceRequests& requests,
-                                  size_t thread_count) {
+                                  size_t thread_count,
+                                  uint64_t sequence_count) {
     if (requests.size() <= 1) return;
-    const uint64_t max_sequence_id = std::max_element(
-        requests.begin(), requests.end(),
-        [](const SequenceRequest& left, const SequenceRequest& right) {
-            return left.sequence_id < right.sequence_id;
-        })->sequence_id;
-    if (max_sequence_id >
+    if (sequence_count == 0 || sequence_count - 1 >
         static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
         std::sort(requests.begin(), requests.end(),
                   [](const SequenceRequest& left,
