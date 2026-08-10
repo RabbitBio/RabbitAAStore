@@ -34,6 +34,20 @@ struct ReadPlan {
     uint64_t unique_packed_bytes = 0;
     uint64_t read_bytes = 0;
     uint64_t merged_gaps = 0;
+    uint64_t selected_merge_gap_bytes = 0;
+    uint64_t max_range_bytes = 0;
+    uint64_t estimated_io_ns = 0;
+    uint64_t merge_candidates = 0;
+};
+
+struct ByteRangePlanOptions {
+    bool adaptive_merge_gap = false;
+    uint64_t merge_gap_bytes = kByteRangeMergeGapBytes;
+    uint64_t io_latency_ns = kAdaptiveIoLatencyNs;
+    uint64_t io_bandwidth_bytes_per_second =
+        kAdaptiveIoBandwidthBytesPerSecond;
+    uint64_t max_merged_range_bytes = kAdaptiveMaxRangeBytes;
+    size_t io_threads = 1;
 };
 
 void sort_requests_by_sequence_id(SequenceRequests& requests,
@@ -42,7 +56,8 @@ void sort_requests_by_sequence_id(SequenceRequests& requests,
 
 ReadPlan plan_byte_ranges(const SequenceRequests& sorted_requests,
                           uint64_t page_residues,
-                          uint64_t packed_page_bytes);
+                          uint64_t packed_page_bytes,
+                          const ByteRangePlanOptions& options = {});
 
 }  // namespace aastore::detail
 

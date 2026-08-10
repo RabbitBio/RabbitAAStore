@@ -25,6 +25,14 @@ struct Arguments {
     uint64_t seed = 12345;
     size_t threads = 8;
     bool drop_cache = false;
+    bool adaptive_gap = false;
+    bool cache_aware_adaptive = true;
+    uint64_t merge_gap_bytes = aastore::kByteRangeMergeGapBytes;
+    uint64_t io_latency_ns = aastore::kAdaptiveIoLatencyNs;
+    uint64_t cold_io_latency_ns = aastore::kAdaptiveColdIoLatencyNs;
+    uint64_t io_bandwidth_mib_per_second = 8192;
+    uint64_t cold_io_bandwidth_mib_per_second = 4096;
+    uint64_t max_range_mib = 1;
 };
 
 uint64_t parse_u64(const char* text, const char* name) {
@@ -41,7 +49,12 @@ Arguments parse_arguments(int argc, char** argv) {
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: aastore_bench STORE [--requests N] [--seed N] "
-            "[--threads N] [--drop-cache]");
+            "[--threads N] [--drop-cache] [--adaptive-gap] "
+            "[--merge-gap N] [--io-latency-ns N] "
+            "[--cold-io-latency-ns N] "
+            "[--io-bandwidth-mib-per-second N] "
+            "[--cold-io-bandwidth-mib-per-second N] "
+            "[--no-cache-aware] [--max-range-mib N]");
     }
     Arguments arguments;
     arguments.store = argv[1];
@@ -63,6 +76,29 @@ Arguments parse_arguments(int argc, char** argv) {
                 parse_u64(next("--threads"), "threads"));
         } else if (option == "--drop-cache") {
             arguments.drop_cache = true;
+        } else if (option == "--adaptive-gap") {
+            arguments.adaptive_gap = true;
+        } else if (option == "--no-cache-aware") {
+            arguments.cache_aware_adaptive = false;
+        } else if (option == "--merge-gap") {
+            arguments.merge_gap_bytes =
+                parse_u64(next("--merge-gap"), "merge gap");
+        } else if (option == "--io-latency-ns") {
+            arguments.io_latency_ns =
+                parse_u64(next("--io-latency-ns"), "I/O latency");
+        } else if (option == "--cold-io-latency-ns") {
+            arguments.cold_io_latency_ns = parse_u64(
+                next("--cold-io-latency-ns"), "cold I/O latency");
+        } else if (option == "--io-bandwidth-mib-per-second") {
+            arguments.io_bandwidth_mib_per_second = parse_u64(
+                next("--io-bandwidth-mib-per-second"), "I/O bandwidth");
+        } else if (option == "--cold-io-bandwidth-mib-per-second") {
+            arguments.cold_io_bandwidth_mib_per_second = parse_u64(
+                next("--cold-io-bandwidth-mib-per-second"),
+                "cold I/O bandwidth");
+        } else if (option == "--max-range-mib") {
+            arguments.max_range_mib =
+                parse_u64(next("--max-range-mib"), "maximum range");
         } else {
             throw std::invalid_argument("unknown option: " + option);
         }
@@ -76,6 +112,14 @@ uint64_t splitmix64(uint64_t& state) {
     value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
     value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
     return value ^ (value >> 31);
+}
+
+uint64_t mib_to_bytes(uint64_t value, const char* name) {
+    constexpr uint64_t kMiB = 1024ULL * 1024ULL;
+    if (value > std::numeric_limits<uint64_t>::max() / kMiB) {
+        throw std::overflow_error(std::string(name) + " is too large");
+    }
+    return value * kMiB;
 }
 
 std::vector<aastore::SequenceId> make_ids(uint64_t size,
@@ -150,6 +194,9 @@ int main(int argc, char** argv) {
             drop_file_cache(arguments.store / "pages.bin");
             drop_file_cache(arguments.store / "meta.bin");
             drop_file_cache(arguments.store / "meta.compact_u32.bin");
+            // DONTNEED is advisory and eviction may complete asynchronously
+            // on shared filesystems. Keep the wait outside measured time.
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
         const auto total_start = Clock::now();
@@ -160,6 +207,18 @@ int main(int argc, char** argv) {
             store.size(), arguments.requests, arguments.seed);
         aastore::ReadOptions options;
         options.io_threads = arguments.threads;
+        options.adaptive_merge_gap = arguments.adaptive_gap;
+        options.adaptive.cache_aware = arguments.cache_aware_adaptive;
+        options.merge_gap_bytes = arguments.merge_gap_bytes;
+        options.adaptive.io_latency_ns = arguments.io_latency_ns;
+        options.adaptive.cold_io_latency_ns = arguments.cold_io_latency_ns;
+        options.adaptive.io_bandwidth_bytes_per_second = mib_to_bytes(
+            arguments.io_bandwidth_mib_per_second, "I/O bandwidth");
+        options.adaptive.cold_io_bandwidth_bytes_per_second = mib_to_bytes(
+            arguments.cold_io_bandwidth_mib_per_second,
+            "cold I/O bandwidth");
+        options.adaptive.max_merged_range_bytes = mib_to_bytes(
+            arguments.max_range_mib, "maximum range");
         const auto fetch_start = Clock::now();
         const aastore::Batch batch = store.batch_get(ids, options);
         const double fetch_ms = elapsed_ms(fetch_start);
@@ -175,13 +234,43 @@ int main(int argc, char** argv) {
                   << "checksum=" << sum << '\n'
                   << "threads=" << arguments.threads << '\n'
                   << "decode_kernel=" << store.decode_kernel_name() << '\n'
-                  << "merge_gap_bytes="
-                  << aastore::kByteRangeMergeGapBytes << '\n'
+                  << "merge_policy="
+                  << (arguments.adaptive_gap ? "adaptive" : "fixed") << '\n'
+                  << "configured_merge_gap_bytes="
+                  << arguments.merge_gap_bytes << '\n'
+                  << "selected_merge_gap_bytes="
+                  << batch.stats.selected_merge_gap_bytes << '\n'
+                  << "io_latency_ns=" << arguments.io_latency_ns << '\n'
+                  << "cold_io_latency_ns="
+                  << arguments.cold_io_latency_ns << '\n'
+                  << "io_bandwidth_mib_per_second="
+                  << arguments.io_bandwidth_mib_per_second << '\n'
+                  << "cold_io_bandwidth_mib_per_second="
+                  << arguments.cold_io_bandwidth_mib_per_second << '\n'
+                  << "cache_aware_adaptive="
+                  << arguments.cache_aware_adaptive << '\n'
+                  << "modeled_io_bandwidth_mib_per_second="
+                  << batch.stats.modeled_io_bandwidth_bytes_per_second /
+                         (1024.0 * 1024.0) << '\n'
+                  << "modeled_io_latency_ns="
+                  << batch.stats.modeled_io_latency_ns << '\n'
+                  << "page_cache_resident_percent="
+                  << (batch.stats.page_cache_residency_known &&
+                              batch.stats.page_cache_total_bytes != 0
+                          ? 100.0 * batch.stats.page_cache_resident_bytes /
+                                batch.stats.page_cache_total_bytes
+                          : -1.0) << '\n'
+                  << "max_range_mib=" << arguments.max_range_mib << '\n'
+                  << "merge_candidates="
+                  << batch.stats.merge_candidates << '\n'
                   << "ranges=" << batch.stats.ranges << '\n'
+                  << "max_range_bytes=" << batch.stats.max_range_bytes << '\n'
                   << "read_bytes=" << batch.stats.read_bytes << '\n'
                   << "unique_packed_bytes="
                   << batch.stats.unique_packed_bytes << '\n'
                   << "overread_bytes=" << batch.stats.overread_bytes << '\n'
+                  << "estimated_io_ms="
+                  << batch.stats.estimated_io_ns / 1.0e6 << '\n'
                   << "open_ms=" << open_ms << '\n'
                   << "fetch_ms=" << fetch_ms << '\n'
                   << "consume_ms=" << consume_ms << '\n'

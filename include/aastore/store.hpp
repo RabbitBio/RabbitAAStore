@@ -55,9 +55,15 @@ bool operator!=(const NoInitAllocator<T>&,
     return false;
 }
 
-// The refactored reader deliberately has one policy: exact packed-byte ranges
-// separated by no more than 4 KiB are read together.
 inline constexpr uint64_t kByteRangeMergeGapBytes = 4096;
+inline constexpr uint64_t kAdaptiveIoLatencyNs = 5000;
+inline constexpr uint64_t kAdaptiveColdIoLatencyNs = 3000;
+inline constexpr uint64_t kAdaptiveIoBandwidthBytesPerSecond =
+    8ULL * 1024ULL * 1024ULL * 1024ULL;
+inline constexpr uint64_t kAdaptiveColdIoBandwidthBytesPerSecond =
+    4ULL * 1024ULL * 1024ULL * 1024ULL;
+inline constexpr uint64_t kAdaptiveMaxRangeBytes =
+    1ULL * 1024ULL * 1024ULL;
 inline constexpr uint64_t kPackedPageBytes = 4096;
 inline constexpr uint64_t kPageResidues = (kPackedPageBytes * 8) / 5;
 
@@ -79,9 +85,25 @@ public:
                                   const BuildOptions& options = {});
 };
 
+struct AdaptiveMergeOptions {
+    bool cache_aware = true;
+    uint64_t io_latency_ns = kAdaptiveIoLatencyNs;
+    uint64_t cold_io_latency_ns = kAdaptiveColdIoLatencyNs;
+    uint64_t io_bandwidth_bytes_per_second =
+        kAdaptiveIoBandwidthBytesPerSecond;
+    uint64_t cold_io_bandwidth_bytes_per_second =
+        kAdaptiveColdIoBandwidthBytesPerSecond;
+    // Zero disables the cap. A range that is intrinsically larger than the
+    // cap is retained because it cannot be split without duplicating decode.
+    uint64_t max_merged_range_bytes = kAdaptiveMaxRangeBytes;
+};
+
 struct ReadOptions {
     size_t io_threads = 8;
     bool input_sorted = false;
+    bool adaptive_merge_gap = false;
+    uint64_t merge_gap_bytes = kByteRangeMergeGapBytes;
+    AdaptiveMergeOptions adaptive;
 };
 
 struct BatchStats {
@@ -92,7 +114,17 @@ struct BatchStats {
     uint64_t merged_gaps = 0;
     uint64_t read_bytes = 0;
     uint64_t overread_bytes = 0;
+    uint64_t selected_merge_gap_bytes = 0;
+    uint64_t max_range_bytes = 0;
+    uint64_t estimated_io_ns = 0;
+    uint64_t merge_candidates = 0;
+    uint64_t modeled_io_latency_ns = 0;
+    uint64_t modeled_io_bandwidth_bytes_per_second = 0;
+    uint64_t page_cache_resident_bytes = 0;
+    uint64_t page_cache_total_bytes = 0;
     uint64_t workers = 0;
+    bool adaptive_merge_gap = false;
+    bool page_cache_residency_known = false;
     uint64_t layout_ns = 0;
     uint64_t sort_ns = 0;
     uint64_t range_plan_ns = 0;

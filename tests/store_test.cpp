@@ -105,10 +105,88 @@ int main() {
     const aastore::Batch merged = store.batch_get({1, 3});
     expect(merged.stats.ranges == 1, "4 KiB gap merges");
     expect(merged.stats.merged_gaps == 1, "merged gap is counted");
+    expect(merged.stats.selected_merge_gap_bytes == 4096,
+           "fixed merge gap is reported");
+
+    aastore::ReadOptions exact_options;
+    exact_options.merge_gap_bytes = 0;
+    const aastore::Batch exact = store.batch_get({1, 3}, exact_options);
+    expect(exact.stats.ranges == 2, "zero gap keeps disjoint extents");
+    expect(exact.stats.selected_merge_gap_bytes == 0,
+           "zero merge gap is reported");
 
     // p2 is another packed page away, so the gap from p0 exceeds 4 KiB.
     const aastore::Batch separate = store.batch_get({1, 5});
     expect(separate.stats.ranges == 2, "gap above 4 KiB stays separate");
+
+    aastore::ReadOptions transfer_dominated;
+    transfer_dominated.adaptive_merge_gap = true;
+    transfer_dominated.adaptive.cache_aware = false;
+    transfer_dominated.adaptive.io_latency_ns = 0;
+    transfer_dominated.adaptive.io_bandwidth_bytes_per_second = 1;
+    transfer_dominated.adaptive.max_merged_range_bytes = 0;
+    const aastore::Batch adaptive_exact =
+        store.batch_get({1, 3}, transfer_dominated);
+    expect(adaptive_exact.stats.ranges == 2,
+           "adaptive planner avoids overread when latency is free");
+    expect(adaptive_exact.stats.selected_merge_gap_bytes == 0,
+           "adaptive planner selects zero gap for transfer-only cost");
+    expect(adaptive_exact.stats.merge_candidates > 1,
+           "adaptive planner evaluates candidate gaps");
+
+    aastore::ReadOptions latency_dominated;
+    latency_dominated.adaptive_merge_gap = true;
+    latency_dominated.adaptive.cache_aware = false;
+    latency_dominated.adaptive.io_latency_ns = 1000000000ULL;
+    latency_dominated.adaptive.io_bandwidth_bytes_per_second =
+        1000000000000ULL;
+    latency_dominated.adaptive.max_merged_range_bytes = 0;
+    latency_dominated.io_threads = 1;
+    const aastore::Batch adaptive_merged =
+        store.batch_get({1, 5}, latency_dominated);
+    expect(adaptive_merged.stats.ranges == 1,
+           "adaptive planner merges wider gap when latency dominates");
+    expect(adaptive_merged.stats.selected_merge_gap_bytes > 4096,
+           "adaptive planner reports the wider selected gap");
+    expect(adaptive_merged.view(0) == expected[1] &&
+               adaptive_merged.view(1) == expected[5],
+           "adaptive merge preserves decoded sequences");
+
+    aastore::ReadOptions cache_aware;
+    cache_aware.adaptive_merge_gap = true;
+    const aastore::Batch cache_aware_batch =
+        store.batch_get({1, 3, 5}, cache_aware);
+    expect(cache_aware_batch.view(0) == expected[1] &&
+               cache_aware_batch.view(1) == expected[3] &&
+               cache_aware_batch.view(2) == expected[5],
+           "cache-aware adaptive read preserves decoded sequences");
+#ifdef __linux__
+    expect(cache_aware_batch.stats.page_cache_residency_known,
+           "Linux page-cache residency is available");
+    expect(cache_aware_batch.stats.page_cache_total_bytes ==
+               store.packed_bytes(),
+           "page-cache residency covers pages.bin");
+#endif
+
+    bool invalid_model_rejected = false;
+    try {
+        aastore::ReadOptions invalid_model;
+        invalid_model.adaptive_merge_gap = true;
+        invalid_model.adaptive.cache_aware = false;
+        invalid_model.adaptive.io_bandwidth_bytes_per_second = 0;
+        (void)store.batch_get({1}, invalid_model);
+    } catch (const std::invalid_argument&) {
+        invalid_model_rejected = true;
+    }
+    expect(invalid_model_rejected,
+           "adaptive planner rejects zero I/O bandwidth");
+
+    aastore::ReadOptions fixed_without_model;
+    fixed_without_model.adaptive.io_bandwidth_bytes_per_second = 0;
+    const aastore::Batch fixed_without_estimate =
+        store.batch_get({1}, fixed_without_model);
+    expect(fixed_without_estimate.view(0) == expected[1],
+           "fixed planner does not require an I/O model");
 
     const aastore::Batch empty = store.batch_get({});
     expect(empty.size() == 0 && empty.stats.ranges == 0,
