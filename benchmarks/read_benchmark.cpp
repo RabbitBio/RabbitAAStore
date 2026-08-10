@@ -190,6 +190,10 @@ int main(int argc, char** argv) {
                   << "sort_ms=" << batch.stats.sort_ns / 1.0e6 << '\n'
                   << "range_plan_ms="
                   << batch.stats.range_plan_ns / 1.0e6 << '\n'
+                  << "worker_wall_ms="
+                  << batch.stats.worker_wall_ns / 1.0e6 << '\n'
+                  << "worker_max_busy_ms="
+                  << batch.stats.worker_max_busy_ns / 1.0e6 << '\n'
                   << "worker_read_ms=" << batch.stats.read_ns / 1.0e6 << '\n'
                   << "worker_decode_ms="
                   << batch.stats.decode_ns / 1.0e6 << '\n'

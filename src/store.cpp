@@ -161,13 +161,13 @@ public:
 
     Batch batch_get(const std::vector<SequenceId>& ids,
                     const ReadOptions& options) const {
+        const auto layout_start = Clock::now();
         const size_t io_threads = std::max<size_t>(1, options.io_threads);
         Batch batch;
         batch.offsets.resize(ids.size());
         batch.lengths.resize(ids.size());
         batch.stats.requested_sequences = ids.size();
 
-        const auto layout_start = Clock::now();
         detail::SequenceRequests requests(ids.size());
         const size_t prepare_workers = ids.size() >= 65536
             ? std::min(io_threads, ids.size())
@@ -303,7 +303,7 @@ public:
 
         auto run_worker = [&](size_t worker) {
             try {
-                std::vector<uint8_t, detail::NoInitAllocator<uint8_t>> buffer;
+                std::vector<uint8_t, NoInitAllocator<uint8_t>> buffer;
                 while (true) {
                     const size_t range_index =
                         next_range.fetch_add(1, std::memory_order_relaxed);
@@ -421,6 +421,7 @@ public:
             }
         };
 
+        const auto worker_wall_start = Clock::now();
         std::vector<std::thread> workers;
         workers.reserve(worker_count - 1);
         for (size_t worker = 1; worker < worker_count; ++worker) {
@@ -428,12 +429,16 @@ public:
         }
         run_worker(0);
         for (std::thread& worker : workers) worker.join();
+        batch.stats.worker_wall_ns = elapsed_ns(worker_wall_start);
         for (const std::exception_ptr& error : errors) {
             if (error) std::rethrow_exception(error);
         }
         for (const WorkerStats& stats : worker_stats) {
             batch.stats.read_ns += stats.read_ns;
             batch.stats.decode_ns += stats.decode_ns;
+            batch.stats.worker_max_busy_ns = std::max(
+                batch.stats.worker_max_busy_ns,
+                stats.read_ns + stats.decode_ns);
         }
         return batch;
     }

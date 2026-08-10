@@ -1,54 +1,13 @@
 #ifndef AASTORE_BYTE_RANGE_PLANNER_HPP
 #define AASTORE_BYTE_RANGE_PLANNER_HPP
 
+#include "aastore/store.hpp"
+
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <new>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 namespace aastore::detail {
-
-template <typename T>
-class NoInitAllocator {
-public:
-    using value_type = T;
-
-    NoInitAllocator() noexcept = default;
-    template <typename U>
-    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
-
-    T* allocate(size_t count) {
-        return std::allocator<T>{}.allocate(count);
-    }
-    void deallocate(T* pointer, size_t count) noexcept {
-        std::allocator<T>{}.deallocate(pointer, count);
-    }
-    template <typename U, typename... Args>
-    void construct(U* pointer, Args&&... args) {
-        if constexpr (sizeof...(Args) != 0 ||
-                      !std::is_trivially_default_constructible_v<U>) {
-            ::new (static_cast<void*>(pointer))
-                U(std::forward<Args>(args)...);
-        } else {
-            (void)pointer;
-        }
-    }
-};
-
-template <typename T, typename U>
-bool operator==(const NoInitAllocator<T>&,
-                const NoInitAllocator<U>&) noexcept {
-    return true;
-}
-
-template <typename T, typename U>
-bool operator!=(const NoInitAllocator<T>&,
-                const NoInitAllocator<U>&) noexcept {
-    return false;
-}
 
 struct SequenceRequest {
     uint64_t sequence_id;

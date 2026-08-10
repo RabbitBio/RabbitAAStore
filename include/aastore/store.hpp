@@ -5,13 +5,55 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <new>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace aastore {
 
 using SequenceId = uint64_t;
+
+template <typename T>
+class NoInitAllocator {
+public:
+    using value_type = T;
+
+    NoInitAllocator() noexcept = default;
+    template <typename U>
+    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+
+    T* allocate(size_t count) {
+        return std::allocator<T>{}.allocate(count);
+    }
+    void deallocate(T* pointer, size_t count) noexcept {
+        std::allocator<T>{}.deallocate(pointer, count);
+    }
+    template <typename U, typename... Args>
+    void construct(U* pointer, Args&&... args) {
+        if constexpr (sizeof...(Args) != 0 ||
+                      !std::is_trivially_default_constructible_v<U>) {
+            ::new (static_cast<void*>(pointer))
+                U(std::forward<Args>(args)...);
+        } else {
+            (void)pointer;
+        }
+    }
+};
+
+template <typename T, typename U>
+bool operator==(const NoInitAllocator<T>&,
+                const NoInitAllocator<U>&) noexcept {
+    return true;
+}
+
+template <typename T, typename U>
+bool operator!=(const NoInitAllocator<T>&,
+                const NoInitAllocator<U>&) noexcept {
+    return false;
+}
 
 // The refactored reader deliberately has one policy: exact packed-byte ranges
 // separated by no more than 4 KiB are read together.
@@ -54,6 +96,8 @@ struct BatchStats {
     uint64_t layout_ns = 0;
     uint64_t sort_ns = 0;
     uint64_t range_plan_ns = 0;
+    uint64_t worker_wall_ns = 0;
+    uint64_t worker_max_busy_ns = 0;
     uint64_t read_ns = 0;
     uint64_t decode_ns = 0;
 };
@@ -85,8 +129,8 @@ public:
     std::string_view view(size_t index) const;
 
     ByteArena storage;
-    std::vector<uint64_t> offsets;
-    std::vector<uint64_t> lengths;
+    std::vector<uint64_t, NoInitAllocator<uint64_t>> offsets;
+    std::vector<uint64_t, NoInitAllocator<uint64_t>> lengths;
     BatchStats stats;
 };
 
