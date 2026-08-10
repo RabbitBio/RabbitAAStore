@@ -14,9 +14,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#ifdef __linux__
-#include <sys/mman.h>
-#endif
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -101,88 +98,6 @@ uint64_t file_size(int descriptor) {
     const off_t end = ::lseek(descriptor, 0, SEEK_END);
     if (end < 0) throw std::runtime_error("cannot size pages.bin");
     return static_cast<uint64_t>(end);
-}
-
-struct CacheResidency {
-    uint64_t resident_bytes = 0;
-    uint64_t total_bytes = 0;
-    bool known = false;
-};
-
-CacheResidency page_cache_residency(int descriptor,
-                                    uint64_t file_bytes) noexcept {
-    CacheResidency result;
-    result.total_bytes = file_bytes;
-    if (file_bytes == 0) {
-        result.known = true;
-        return result;
-    }
-#ifdef __linux__
-    if (file_bytes > static_cast<uint64_t>(
-            std::numeric_limits<size_t>::max())) {
-        return result;
-    }
-    const long system_page_size = ::sysconf(_SC_PAGESIZE);
-    if (system_page_size <= 0) return result;
-    const uint64_t page_size = static_cast<uint64_t>(system_page_size);
-    const uint64_t page_count = 1 + (file_bytes - 1) / page_size;
-    if (page_count > static_cast<uint64_t>(
-            std::numeric_limits<size_t>::max())) {
-        return result;
-    }
-    void* mapping = ::mmap(nullptr, static_cast<size_t>(file_bytes),
-                           PROT_NONE, MAP_SHARED, descriptor, 0);
-    if (mapping == MAP_FAILED) return result;
-    constexpr uint64_t kResidencySamples = 64;
-    const uint64_t sample_count = std::min(page_count, kResidencySamples);
-    uint64_t resident_samples = 0;
-    bool complete = true;
-    for (uint64_t sample = 0; sample < sample_count; ++sample) {
-        const uint64_t page_index = sample_count == 1
-            ? 0
-            : sample * (page_count - 1) / (sample_count - 1);
-        const uint64_t offset = page_index * page_size;
-        unsigned char residency = 0;
-        const size_t length = static_cast<size_t>(
-            std::min(page_size, file_bytes - offset));
-        if (::mincore(static_cast<char*>(mapping) + offset, length,
-                      &residency) != 0) {
-            complete = false;
-            break;
-        }
-        resident_samples += (residency & 1U) != 0;
-    }
-    ::munmap(mapping, static_cast<size_t>(file_bytes));
-    if (!complete) return result;
-    result.resident_bytes = static_cast<uint64_t>(
-        static_cast<long double>(file_bytes) * resident_samples /
-        sample_count + 0.5L);
-    result.known = true;
-#else
-    (void)descriptor;
-#endif
-    return result;
-}
-
-uint64_t interpolate_metric(uint64_t cold_value,
-                            uint64_t hot_value,
-                            const CacheResidency& residency) {
-    if (!residency.known || residency.total_bytes == 0) {
-        return hot_value;
-    }
-    const long double fraction =
-        static_cast<long double>(residency.resident_bytes) /
-        residency.total_bytes;
-    const long double effective =
-        static_cast<long double>(cold_value) +
-        (static_cast<long double>(hot_value) - cold_value) *
-            fraction;
-    if (effective <= 0.0L) return 0;
-    if (effective >= static_cast<long double>(
-            std::numeric_limits<uint64_t>::max())) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return static_cast<uint64_t>(effective + 0.5L);
 }
 
 }  // namespace
@@ -356,33 +271,9 @@ public:
         batch.stats.layout_ns = elapsed_ns(layout_start) - batch.stats.sort_ns;
 
         const auto plan_start = Clock::now();
-        CacheResidency cache_residency;
-        uint64_t modeled_latency = options.adaptive.io_latency_ns;
-        uint64_t modeled_bandwidth =
-            options.adaptive.io_bandwidth_bytes_per_second;
-        if (options.adaptive_merge_gap && options.adaptive.cache_aware) {
-            cache_residency = page_cache_residency(
-                pages_descriptor_, metadata_.expected_pages_bytes());
-            modeled_latency = interpolate_metric(
-                options.adaptive.cold_io_latency_ns,
-                options.adaptive.io_latency_ns, cache_residency);
-            modeled_bandwidth = interpolate_metric(
-                options.adaptive.cold_io_bandwidth_bytes_per_second,
-                options.adaptive.io_bandwidth_bytes_per_second,
-                cache_residency);
-        }
-        detail::ByteRangePlanOptions plan_options;
-        plan_options.adaptive_merge_gap = options.adaptive_merge_gap;
-        plan_options.merge_gap_bytes = options.merge_gap_bytes;
-        plan_options.io_latency_ns = modeled_latency;
-        plan_options.io_bandwidth_bytes_per_second =
-            modeled_bandwidth;
-        plan_options.max_merged_range_bytes =
-            options.adaptive.max_merged_range_bytes;
-        plan_options.io_threads = io_threads;
         const detail::ReadPlan plan = detail::plan_byte_ranges(
             requests, metadata_.page_residues(),
-            metadata_.packed_page_bytes(), plan_options);
+            metadata_.packed_page_bytes());
         batch.stats.range_plan_ns = elapsed_ns(plan_start);
         batch.stats.requested_residues = plan.requested_residues;
         batch.stats.unique_packed_bytes = plan.unique_packed_bytes;
@@ -391,19 +282,6 @@ public:
         batch.stats.read_bytes = plan.read_bytes;
         batch.stats.overread_bytes =
             plan.read_bytes - plan.unique_packed_bytes;
-        batch.stats.selected_merge_gap_bytes =
-            plan.selected_merge_gap_bytes;
-        batch.stats.max_range_bytes = plan.max_range_bytes;
-        batch.stats.estimated_io_ns = plan.estimated_io_ns;
-        batch.stats.merge_candidates = plan.merge_candidates;
-        batch.stats.modeled_io_latency_ns = modeled_latency;
-        batch.stats.modeled_io_bandwidth_bytes_per_second =
-            modeled_bandwidth;
-        batch.stats.page_cache_resident_bytes =
-            cache_residency.resident_bytes;
-        batch.stats.page_cache_total_bytes = cache_residency.total_bytes;
-        batch.stats.adaptive_merge_gap = options.adaptive_merge_gap;
-        batch.stats.page_cache_residency_known = cache_residency.known;
 
         const bool parallel_single_range = plan.ranges.size() == 1 &&
             io_threads > 1 && requests.size() >= 65536;
