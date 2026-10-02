@@ -22,7 +22,7 @@ range planner 和磁盘 I/O。三种模式共用磁盘格式和解码 kernel。
 
 x86-64 构建使用可移植基线指令集。运行时根据 CPU 能力选择 AVX-512、AVX2/BMI2 或
 scalar 建库和解码路径，因此同一个二进制可部署到不同 SIMD 能力的机器，不需要使用
-`-march=native` 重新编译。非 x86 平台使用 scalar 路径。
+`-march=native` 重新编译。scalar 回退用于支持范围内的 x86-64 CPU，不代表支持其他架构。
 
 ## 文件职责
 
@@ -39,7 +39,12 @@ src/store.cpp                  三种模式的 batch 编排、并行解码和 sc
 
 ## 构建
 
-支持 Linux、C++17 和 GCC/Clang。普通 C++ 构建不依赖 Python；liburing 是可选依赖。
+当前支持与验证范围为 **Linux x86_64、64 位、小端、glibc**，编译器为支持 C++17 的
+**GCC/Clang**。此说明用于提醒当前支持范围；范围之外的平台尚未验证，不承诺可用性。
+普通 C++ 构建不依赖 Python；liburing 是可选依赖。
+CMake 会实际编译并链接 `std::filesystem` 探测程序，按所选标准库决定是否需要
+`stdc++fs` 或 `c++fs`，也支持 Clang 配旧 libstdc++；安装的 CMake target 和
+pkg-config 元数据会传递所需链接库。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -48,12 +53,19 @@ cmake --build build -j 4
 ```
 
 Store 测试按 `builder`、`random`、`sequential`、`text`、`concurrency` 分组，可单独
-选择；`options` 检查配置校验。默认测试命令仍运行全部测试：
+选择；`options` 检查配置校验。`compatibility` 检查旧内核、旧 liburing 读取路径和
+CMake 交叉编译流程，即使宿主禁用 io_uring 也会运行。默认测试命令仍运行全部测试：
 
 ```bash
 (cd build && ctest -L sequential --output-on-failure)
+(cd build && ctest -L compatibility --output-on-failure)
 ./build/aastore_test --group text
 ```
+
+交叉编译时通过 `CMAKE_TOOLCHAIN_FILE` 指定工具链。安装后的 SDK 测试会沿用工具链、
+sysroot、编译参数和 `CMAKE_CROSSCOMPILING_EMULATOR`；有模拟器时运行读取测试，
+无模拟器时只验证配置与构建，并禁用目标程序的运行测试。当前 Python 和 benchmark
+脚本测试只在本机构建中注册。
 
 顶层构建默认启用工具、基准和测试；通过 `add_subdirectory` 接入其他项目时，三者默认
 关闭。可分别用 `AASTORE_BUILD_TOOLS`、`AASTORE_BUILD_BENCHMARKS`、`AASTORE_BUILD_TESTS`
@@ -102,7 +114,10 @@ cmake --build build-example -j 4
 
 ## Python 接口
 
-支持 Linux、Python 3.9 及以上版本。在仓库根目录安装；本机需要 C++17 编译器
+预编译 wheel 支持上述 Linux x86_64/glibc 平台的普通 **CPython 3.9–3.13**。
+源码包声明 `Python >=3.9`，可在相同平台上尝试更新的 CPython，但这些版本尚不在当前
+wheel 支持与验证范围内；其他 Python 实现和特殊 ABI 同样尚未验证，不承诺可用性。
+在仓库根目录从源码安装时，本机需要支持 C++17 的 GCC/Clang
 和 Python 开发头文件，其他编译依赖由 pip 的隔离构建环境准备。无需安装 NumPy：
 
 ```bash
@@ -375,6 +390,11 @@ PrefixMemory 的前缀命中由这些相同的线程在各自首次提交 I/O �
 补发读取；单个命中组不会拆分，因此超大组可以超过字节粒度。前缀任务耗尽后才
 阻塞等待 I/O，不额外启动前缀线程。
 全命中批次直接并行解码，无需创建 ring。
+初始化 ring 时优先使用内核支持的 `READ`，仅支持 `READV` 时使用单个 `iovec`；
+Linux 5.4 等缺少操作码探测接口的内核直接使用 `READV`，并保持 `iovec` 到读取完成。
+旧 liburing 缺少 `READ` 或探测 API 时也保留 `READV` 路径。后端初始化失败或探测确认
+没有可用读取操作时，`Auto` 回退到 `pread`，显式 `IoUring` 报错；实际读取、提交或
+解码回调中的错误仍向调用方传播。
 `pread` 工作线程各自执行读取和解码；前缀命中与文件读取分阶段执行。
 旧读取参数 `io_threads`、`io_uring_workers`、`io_decode_threads` 已合并为 `threads`，
 打开库的 `preload_threads` 也更名为 `threads`；调用方需要更新配置并重新编译。

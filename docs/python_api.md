@@ -13,13 +13,18 @@ python examples/python/buffer_layout.py
 
 ## 1. 安装与输入
 
-当前支持 Linux、Python 3.9 及以上版本。在仓库根目录安装：
+当前支持与验证范围为 Linux x86_64、64 位、小端、glibc，使用支持 C++17 的 GCC/Clang。
+预编译 wheel 覆盖普通 CPython 3.9–3.13。这些说明用于提醒当前支持范围；范围之外的
+平台、Python 实现和特殊 ABI 尚未验证，不承诺可用性。
+源码包声明 `Python >=3.9`，可在相同平台上尝试更新的 CPython，但这些版本尚不在
+当前 wheel 支持与验证范围内。在仓库根目录从源码安装：
 
 ```bash
 python -m pip install .
 ```
 
-本机需要 C++17 编译器和 Python 开发头文件，其他编译依赖由 pip 的隔离构建环境准备。
+本机需要支持 C++17 的 GCC/Clang 和 Python 开发头文件，其他编译依赖由 pip 的
+隔离构建环境准备。
 NumPy 是可选的使用工具，不是 AAStore 的运行依赖。
 
 Python 包默认禁用 io_uring，使用 pread；portable wheels 工作流也采用此配置。
@@ -156,6 +161,9 @@ with aastore.Store(path, opening) as store:
 
 `Auto` 在当前构建和运行环境允许时使用 io_uring，否则回退到 pread；显式指定
 `IoUring` 时，不可用会抛出异常。FullMemory 命中内存的路径无需磁盘 I/O。
+io_uring 初始化时优先使用支持的 `READ`，仅支持 `READV` 或缺少操作码探测接口
+时使用 `READV`，兼容 Linux 5.4。后端初始化失败或探测确认没有可用读取操作时
+才按上述规则回退；真实读取或回调错误会抛出异常。
 `sequential_get()` 和 `sequential_get_into()` 使用 pread 顺读路径，
 不会因为 `io_backend=IoUring` 改成 io_uring。
 

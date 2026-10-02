@@ -73,7 +73,8 @@ struct ReadOptions {
     // 每次批读用于排序、范围规划、I/O 和解码的最大工作线程数；
     // 包含调用线程，零按一个线程处理。
     size_t threads = 8;
-    // 读取后端；Auto 优先尝试 io_uring，不可用时回退到 pread。
+    // 读取后端；io_uring 按能力选择 READ/READV，旧内核使用 READV。
+    // Auto 在初始化或操作码不可用时回退到 pread；实际读错仍抛出异常。
     // Pread 强制使用 pread，IoUring 不可用时抛出异常。
     IoBackend io_backend = IoBackend::Auto;
     // 每个 io_uring 工作线程所管理 ring 的最大队列深度；

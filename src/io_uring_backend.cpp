@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -14,6 +16,7 @@
 
 #if defined(AASTORE_HAVE_IO_URING)
 #include <liburing.h>
+#include <sys/uio.h>
 #endif
 
 namespace aastore {
@@ -25,12 +28,15 @@ struct ReadSlot {
     size_t range_index = 0;
     uint64_t completed = 0;
     std::vector<uint8_t, NoInitAllocator<uint8_t>> buffer;
+    // Linux 5.4 及以前要求 READV 的 iovec 一直有效到完成事件到达。
+    iovec vector {};
 };
 
 struct ReadRing {
     io_uring ring {};
     bool initialized = false;
     bool busy = false;
+    bool use_readv = true;
     size_t capacity = 0;
     std::vector<ReadSlot> slots;
 
@@ -44,6 +50,30 @@ struct ReadRing {
     // 释放当前 ring 的内核资源。
     ~ReadRing() { reset(); }
 };
+
+// 依据操作码能力选择读取方式；旧内核或旧 liburing 无探测接口时使用 READV。
+// 探测失败不代表读取失败，后续真实 I/O 和回调错误仍照常向调用方传播。
+bool select_read_opcode(ReadRing& state, std::string& unavailable_reason) {
+    state.use_readv = true;
+#if defined(AASTORE_URING_HAS_PROBE)
+    const std::unique_ptr<io_uring_probe, decltype(&std::free)> probe(
+        io_uring_get_probe_ring(&state.ring), &std::free);
+    if (!probe) return true;
+#if defined(AASTORE_URING_HAS_READ)
+    if (io_uring_opcode_supported(probe.get(), IORING_OP_READ)) {
+        state.use_readv = false;
+        return true;
+    }
+#endif
+    if (!io_uring_opcode_supported(probe.get(), IORING_OP_READV)) {
+        unavailable_reason = "no usable io_uring READ or READV opcode";
+        return false;
+    }
+#else
+    (void)unavailable_reason;
+#endif
+    return true;
+}
 
 // 每个同步调用线程最多保留 16 MiB 读取缓冲；较大范围、
 // 嵌套回调和多线程调用使用临时 ring。
@@ -118,11 +148,21 @@ void prepare_partition_read(PartitionIoContext* ctx, size_t slot_index,
     if (sqe == nullptr) {
         throw std::runtime_error("io_uring submission queue is full");
     }
-    io_uring_prep_read(
-        sqe, ctx->descriptor,
-        slot.buffer.data() + static_cast<size_t>(slot.completed),
-        static_cast<unsigned>(remaining),
-        static_cast<off_t>(range.begin + slot.completed));
+    const auto offset = static_cast<off_t>(range.begin + slot.completed);
+#if defined(AASTORE_URING_HAS_READ)
+    if (!ctx->ring->use_readv) {
+        io_uring_prep_read(
+            sqe, ctx->descriptor,
+            slot.buffer.data() + static_cast<size_t>(slot.completed),
+            static_cast<unsigned>(remaining), offset);
+    } else
+#endif
+    {
+        slot.vector.iov_base =
+            slot.buffer.data() + static_cast<size_t>(slot.completed);
+        slot.vector.iov_len = static_cast<size_t>(remaining);
+        io_uring_prep_readv(sqe, ctx->descriptor, &slot.vector, 1, offset);
+    }
     sqe->user_data = static_cast<unsigned long long>(slot_index);
 }
 
@@ -259,6 +299,7 @@ bool read_range_partition_io_uring(
         }
         guard.initialized = true;
         guard.capacity = capacity;
+        if (!select_read_opcode(guard, unavailable_reason)) return false;
         guard.slots.resize(capacity);
     }
     std::vector<ReadSlot>& slots = guard.slots;
@@ -396,7 +437,7 @@ void run_range_worker(RangeWorkerContext* ctx, size_t worker) noexcept {
 }  // namespace
 #endif
 
-// 按累计字节划分有序范围并执行读取；后端初始化不可用时返回 false。
+// 按累计字节划分有序范围并执行读取；初始化或读取操作码不可用时返回 false。
 bool read_ranges_io_uring(int descriptor,
                           const std::vector<ByteRange>& ranges,
                           size_t worker_count,

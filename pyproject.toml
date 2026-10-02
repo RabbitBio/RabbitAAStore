@@ -49,6 +49,7 @@ AASTORE_ENABLE_IO_URING = "OFF"
 BUILD_SHARED_LIBS = "OFF"
 
 [tool.cibuildwheel]
+# Supported wheels: standard CPython 3.9-3.13 on Linux x86_64 with glibc.
 build = "cp{39,310,311,312,313}-manylinux_x86_64"
 archs = ["x86_64"]
 test-command = [

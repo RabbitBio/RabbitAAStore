@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Document the current support and validation scope as a reminder: Linux x86_64, 64-bit,
+  little-endian, glibc, with a C++17 GCC/Clang toolchain and ordinary CPython
+  3.9–3.13 wheels, while retaining Python >=3.9 source-package metadata.
+  Targets outside this scope remain unverified, with no compatibility guarantee.
+- Link liburing and thread capability probes during cross-compilation, replacing
+  stale compile-only results. Preserve toolchain settings and emulator lists in
+  installed SDK tests, and skip target execution when no emulator is configured.
+- Detect filesystem link requirements with the selected C++ toolchain instead
+  of compiler versions, including Clang with older standard libraries, and
+  propagate any required companion library to SDK consumers.
+- Select io_uring READ/READV by kernel capabilities, using READV when opcode
+  probing is unavailable and preserving iovec lifetime for Linux 5.4.
+- Detect baseline and optional liburing APIs at configure time so older
+  READV-only libraries remain usable; check static SDK probe dependencies and
+  liburing structure layouts before linking a consumer.
 - Centralize option validation and reject unknown storage modes, I/O backends,
   and read strategies before file access or output writes, including empty reads.
 - Expose optional `validate()` checks for C++ and Python configuration objects
