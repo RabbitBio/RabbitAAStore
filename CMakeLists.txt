@@ -330,7 +330,7 @@ if(AASTORE_BUILD_TESTS)
         endif()
     endif()
     unset(_aastore_runtime_tests)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/tests/install_consumer/toolchain_cache.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/tests/install_consumer/run.cmake")
     set(_aastore_consumer_toolchain_cache
         "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-toolchain.cmake")
     aastore_write_consumer_toolchain_cache("${_aastore_consumer_toolchain_cache}")
@@ -358,7 +358,7 @@ if(AASTORE_BUILD_TESTS)
                 "-DAASTORE_TEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
                 "-DAASTORE_TEST_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
                 "-DAASTORE_TEST_GENERATOR=${CMAKE_GENERATOR}"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/uring_cross_probe/run.cmake")
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/uring_cross_probe.cmake")
         set_tests_properties(aastore_cmake_uring_cross_probe PROPERTIES
             LABELS "compatibility;cmake;io_uring")
         add_test(NAME aastore_cmake_cross_consumer
@@ -372,7 +372,7 @@ if(AASTORE_BUILD_TESTS)
                 "-DAASTORE_TEST_CTEST=${CMAKE_CTEST_COMMAND}"
                 "-DAASTORE_TEST_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
                 "-DAASTORE_TEST_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/cross_consumer/run.cmake")
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/cross_consumer.cmake")
         set_tests_properties(aastore_cmake_cross_consumer PROPERTIES
             LABELS "compatibility;cmake;packaging")
     endif()

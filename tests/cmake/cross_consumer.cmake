@@ -16,47 +16,97 @@ endfunction()
 
 # A same-architecture cross build exercises both branches without requiring a
 # second compiler. Toolchain and emulator paths intentionally contain spaces.
-set(fixture_dir "${CMAKE_CURRENT_LIST_DIR}")
+set(emulator_template [====[
+cmake_minimum_required(VERSION 3.16)
+
+if(NOT AASTORE_EMULATOR_SENTINEL STREQUAL "argument with spaces")
+    message(FATAL_ERROR "Emulator arguments were not preserved")
+endif()
+set(command)
+set(after_separator OFF)
+math(EXPR last_argument "${CMAKE_ARGC} - 1")
+foreach(index RANGE 0 ${last_argument})
+    if(after_separator)
+        list(APPEND command "${CMAKE_ARGV${index}}")
+    elseif(CMAKE_ARGV${index} STREQUAL "--")
+        set(after_separator ON)
+    endif()
+endforeach()
+# The fixture sysroot '/' makes old CMake strip '/' from build RPATHs.
+list(GET command 0 executable)
+get_filename_component(library_dir "${executable}" DIRECTORY)
+set(ENV{LD_LIBRARY_PATH} "${library_dir}:$ENV{LD_LIBRARY_PATH}")
+execute_process(COMMAND ${command} RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "Emulated SDK consumer failed: ${result}")
+endif()
+file(APPEND "${AASTORE_EMULATOR_MARKER}"
+    "Executed ${command}; sentinel=${AASTORE_EMULATOR_SENTINEL}\n")
+]====])
+set(toolchain_template [====[
+set(CMAKE_SYSTEM_NAME [==[@AASTORE_TEST_SYSTEM_NAME@]==])
+set(CMAKE_CXX_COMPILER [==[@AASTORE_TEST_CXX_COMPILER@]==])
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+set(CMAKE_SYSROOT [==[@fixture_sysroot@]==])
+if(CMAKE_SOURCE_DIR STREQUAL [==[@AASTORE_SOURCE_DIR@/tests/install_consumer]==])
+    file(APPEND [==[@toolchain_marker@]==] "Consumer toolchain loaded\n")
+else()
+    # The consumer must inherit these settings from the producer's cache.
+    set(CMAKE_CXX_COMPILER_ARG1 "-DAASTORE_CROSS_COMPILER_ARGUMENT=1")
+    set(CMAKE_CXX_FLAGS [==[@AASTORE_TEST_CXX_FLAGS@ -DAASTORE_CROSS_TOOLCHAIN=1 -include "@case_dir@/runtime marker.hpp"]==])
+    set(CMAKE_CROSSCOMPILING_EMULATOR [==[@fixture_emulator@]==])
+endif()
+]====])
+set(runtime_marker_template [====[
+#include <cstdio>
+
+#ifndef AASTORE_CROSS_TOOLCHAIN
+#error "SDK consumer lost the toolchain compiler flags"
+#endif
+#ifndef AASTORE_CROSS_COMPILER_ARGUMENT
+#error "SDK consumer lost the toolchain compiler argument"
+#endif
+
+namespace {
+struct AAStoreCrossConsumerRuntimeMarker {
+    AAStoreCrossConsumerRuntimeMarker() {
+        if (std::FILE* stream = std::fopen("@marker_cxx_path@", "a")) {
+            std::fputs("Target executable was actually started\n", stream);
+            std::fclose(stream);
+        }
+    }
+};
+const AAStoreCrossConsumerRuntimeMarker aastore_cross_consumer_runtime_marker;
+}  // namespace
+]====])
+
 file(REMOVE_RECURSE "${AASTORE_TEST_BINARY_DIR}")
+file(MAKE_DIRECTORY "${AASTORE_TEST_BINARY_DIR}")
+set(emulator_file "${AASTORE_TEST_BINARY_DIR}/emulator fixture.cmake")
+file(WRITE "${emulator_file}" "${emulator_template}")
 foreach(mode IN ITEMS without-emulator with-emulator)
     set(case_dir "${AASTORE_TEST_BINARY_DIR}/${mode}")
     set(producer_build "${case_dir}/producer-build")
     set(toolchain_file "${producer_build}/toolchains/cross toolchain.cmake")
-    set(settings_file "${case_dir}/settings.cmake")
     set(runtime_marker "${case_dir}/consumer-executed.txt")
     set(emulator_marker "${case_dir}/emulator-executed.txt")
     set(toolchain_marker "${case_dir}/consumer-toolchain-loaded.txt")
     file(MAKE_DIRECTORY "${producer_build}/toolchains")
-    set(CMAKE_SYSTEM_NAME "${AASTORE_TEST_SYSTEM_NAME}")
-    set(CMAKE_CXX_COMPILER "${AASTORE_TEST_CXX_COMPILER}")
-    set(CMAKE_CXX_COMPILER_ARG1 "-DAASTORE_CROSS_COMPILER_ARGUMENT=1")
-    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-    set(CMAKE_CXX_FLAGS "${AASTORE_TEST_CXX_FLAGS} -DAASTORE_CROSS_TOOLCHAIN=1 -include \"${case_dir}/runtime marker.hpp\"")
-    set(CMAKE_CXX_FLAGS_RELEASE "-DAASTORE_CROSS_RELEASE=1")
-    set(CMAKE_FIND_ROOT_PATH "${case_dir}/first root;${case_dir}/second root")
-    set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-    set(CMAKE_SYSROOT "${AASTORE_TEST_SYSROOT}")
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND "${CMAKE_SYSROOT}" STREQUAL "")
-        set(CMAKE_SYSROOT /)
+    set(fixture_sysroot "${AASTORE_TEST_SYSROOT}")
+    if(AASTORE_TEST_SYSTEM_NAME STREQUAL "Linux" AND "${fixture_sysroot}" STREQUAL "")
+        set(fixture_sysroot /)
     endif()
-    set(CMAKE_CROSSCOMPILING_EMULATOR "")
+    set(fixture_emulator "")
     if(mode STREQUAL "with-emulator")
-        set(CMAKE_CROSSCOMPILING_EMULATOR "${CMAKE_COMMAND};-DAASTORE_EMULATOR_MARKER=${emulator_marker};-DAASTORE_EMULATOR_SENTINEL=argument with spaces;-P;${fixture_dir}/emulator.cmake;--")
+        set(fixture_emulator "${CMAKE_COMMAND};-DAASTORE_EMULATOR_MARKER=${emulator_marker};-DAASTORE_EMULATOR_SENTINEL=argument with spaces;-P;${emulator_file};--")
     endif()
-    set(checked_variables CMAKE_SYSTEM_NAME CMAKE_CXX_COMPILER CMAKE_CXX_COMPILER_ARG1
-        CMAKE_TRY_COMPILE_TARGET_TYPE CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_RELEASE
-        CMAKE_FIND_ROOT_PATH CMAKE_FIND_ROOT_PATH_MODE_PROGRAM
-        CMAKE_SYSROOT CMAKE_CROSSCOMPILING_EMULATOR)
-    file(WRITE "${settings_file}" "")
-    foreach(variable IN LISTS checked_variables)
-        # Bracket quoting retains semicolon-separated lists in the fixture.
-        file(APPEND "${settings_file}" "set(${variable} [==[${${variable}}]==])\n")
-    endforeach()
-    configure_file("${fixture_dir}/toolchain.cmake.in" "${toolchain_file}" @ONLY)
+    string(CONFIGURE "${toolchain_template}" toolchain_contents @ONLY)
+    file(WRITE "${toolchain_file}" "${toolchain_contents}")
     set(marker_cxx_path "${runtime_marker}")
     string(REPLACE "\\" "\\\\" marker_cxx_path "${marker_cxx_path}")
     string(REPLACE "\"" "\\\"" marker_cxx_path "${marker_cxx_path}")
-    configure_file("${fixture_dir}/runtime_marker.hpp.in" "${case_dir}/runtime marker.hpp" @ONLY)
+    string(CONFIGURE "${runtime_marker_template}" runtime_marker_contents @ONLY)
+    file(WRITE "${case_dir}/runtime marker.hpp" "${runtime_marker_contents}")
     set(generator_args -G "${AASTORE_TEST_GENERATOR}")
     if(NOT "${AASTORE_TEST_GENERATOR_PLATFORM}" STREQUAL "")
         list(APPEND generator_args -A "${AASTORE_TEST_GENERATOR_PLATFORM}")

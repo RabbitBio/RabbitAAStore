@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Consolidate engineering test fixtures in their runners and remove redundant
+  probe cases and detailed toolchain snapshot checks while retaining legacy
+  io_uring, linked dependency and installed SDK coverage.
 - Document the current support and validation scope as a reminder: Linux x86_64, 64-bit,
   little-endian, glibc, with a C++17 GCC/Clang toolchain and ordinary CPython
   3.9–3.13 wheels, while retaining Python >=3.9 source-package metadata.
