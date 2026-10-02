@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(@AASTORE_PACKAGE_NEEDS_URING@)
+    # Restore the caller's module path even if the dependency lookup fails.
+    set(_aastore_module_path "${CMAKE_MODULE_PATH}")
+    list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+    find_package(AAStoreUring QUIET)
+    set(CMAKE_MODULE_PATH "${_aastore_module_path}")
+    unset(_aastore_module_path)
+    if(NOT AAStoreUring_FOUND)
+        set(aastore_FOUND FALSE)
+        set(aastore_NOT_FOUND_MESSAGE
+            "This static AAStore SDK requires liburing headers and library")
+        return()
+    endif()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/aastore-targets.cmake")
+check_required_components(aastore)

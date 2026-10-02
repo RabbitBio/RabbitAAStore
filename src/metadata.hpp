@@ -42,7 +42,7 @@ private:
     void* mapping_ = nullptr;
     size_t mapping_bytes_ = 0;
     const uint32_t* offsets_ = nullptr;
-    const uint64_t* bases_ = nullptr;
+    const char* bases_ = nullptr;
     uint32_t block_shift_ = 0;
 };
 

@@ -4,6 +4,7 @@
 
 #include "byte_range_planner.hpp"
 #include "io_uring_backend.hpp"
+#include "thread_helpers.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -419,11 +420,12 @@ struct TextColumn::Impl {
         TextReadContext read{
             descriptor_, &plan, &copy, &next_range, &errors};
         std::vector<std::thread> threads;
+        ThreadJoinGuard join_guard(threads);
         for (size_t worker = 1; worker < workers; ++worker) {
             threads.emplace_back(read_text_ranges, &read, worker);
         }
         read_text_ranges(&read, 0);
-        for (std::thread& thread : threads) thread.join();
+        join_guard.join_all();
         for (const std::exception_ptr& error : errors) {
             if (error) std::rethrow_exception(error);
         }

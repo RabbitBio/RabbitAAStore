@@ -3,6 +3,7 @@
 #include "byte_range_planner.hpp"
 
 #include "aastore/store.hpp"
+#include "thread_helpers.hpp"
 
 #include <algorithm>
 #include <array>
@@ -30,12 +31,13 @@ uint64_t saturating_add(uint64_t left, uint64_t right) {
 template <typename Function>
 void run_parallel(size_t worker_count, Function function) {
     std::vector<std::thread> workers;
+    ThreadJoinGuard join_guard(workers);
     workers.reserve(worker_count - 1);
     for (size_t worker = 1; worker < worker_count; ++worker) {
         workers.emplace_back([&function, worker] { function(worker); });
     }
     function(size_t{0});
-    for (std::thread& worker : workers) worker.join();
+    join_guard.join_all();
 }
 
 // 将带上下文的函数指针适配到索引并行执行器，由调用线程参与执行。

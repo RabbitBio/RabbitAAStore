@@ -1,13 +1,20 @@
 // 文件职责：验证建库、元数据、随机及顺序读取、直接输出和文本列等公开接口。
 // 覆盖多种驻留模式、线程数、异常输入及批次边界，核对结果内容和输出缓冲边界。
 #include "aastore/store.hpp"
+#include "../src/store_io.hpp"
+#if defined(AASTORE_TEST_IO_URING)
+#include "../src/io_uring_backend.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -53,6 +60,34 @@ bool all_true(const bool* values, size_t count) {
         if (!values[i]) return false;
     }
     return true;
+}
+
+// 在调用线程抛异常，其他线程仍须结束；两种任务接口均保留原异常。
+void check_worker_exception_cleanup() {
+    struct Context {
+        std::atomic<size_t> completed{0};
+    };
+    auto worker = [](Context* context, size_t index) {
+        if (index == 0) throw std::runtime_error("caller task failed");
+        context->completed.fetch_add(1, std::memory_order_relaxed);
+    };
+    for (bool use_context : {false, true}) {
+        Context context;
+        bool rejected = false;
+        try {
+            if (use_context) {
+                aastore::run_indexed_workers(4, +worker, &context);
+            } else {
+                aastore::run_indexed_workers(4, [&](size_t index) {
+                    worker(&context, index);
+                });
+            }
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()) == "caller task failed";
+        }
+        expect(rejected && context.completed.load(std::memory_order_relaxed) == 3,
+               "caller task exceptions join all workers and preserve the original error");
+    }
 }
 
 // 核对诊断标记、关闭时的零值，以及非空读取启用后的阶段计时。
@@ -230,6 +265,24 @@ struct TempDir {
     std::filesystem::path path_;
 };
 
+// 偶数记录使 AAPCMP3 的块基址不按八字节对齐，仍须正确打开并读取全部边界。
+void check_even_record_metadata(const std::filesystem::path& root) {
+    const auto fasta = root / "even_records.fa";
+    const auto path = root / "even_records_store";
+    {
+        std::ofstream output(fasta);
+        output << ">one\nACDEFG\n>two\nMKT\n";
+    }
+    aastore::build_fasta(fasta, path);
+    aastore::Store store(path);
+    expect(store.size() == 2 && store.total_residues() == 9 &&
+               store.sequence_length(0) == 6 && store.sequence_length(1) == 3,
+           "even-record metadata preserves sequence boundaries");
+    const auto batch = store.batch_get({1, 0});
+    expect(batch[0] == "MKT" && batch[1] == "ACDEFG",
+           "even-record metadata supports reordered sequence reads");
+}
+
 // 让多个线程切入同一条长序列，并覆盖重复边界、前缀命中和跨调用暂存区复用。
 void check_sequential_into_partitions(const std::filesystem::path& root) {
     const auto fasta = root / "sequential_partitions.fa";
@@ -288,6 +341,45 @@ void check_sequential_into_partitions(const std::filesystem::path& root) {
 }
 
 #if defined(AASTORE_TEST_IO_URING)
+// 真实创建 ring 并读取小文件；只有初始化不可用可跳过，I/O 和回调错误继续失败。
+bool probe_io_uring() {
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        std::tmpfile(), &std::fclose);
+    if (!file) throw std::runtime_error("cannot create io_uring probe fixture");
+    struct Probe {
+        std::array<uint8_t, 4> expected{{17, 31, 63, 127}};
+        bool completed = false;
+    } probe;
+    if (std::fwrite(probe.expected.data(), 1, probe.expected.size(), file.get()) !=
+            probe.expected.size() || std::fflush(file.get()) != 0) {
+        throw std::runtime_error("cannot write io_uring probe fixture");
+    }
+    const auto complete = [](void* opaque, size_t worker, size_t index,
+                             const uint8_t* data, uint64_t size) {
+        auto& state = *static_cast<Probe*>(opaque);
+        if (worker != 0 || index != 0 || size != state.expected.size() ||
+            !std::equal(state.expected.begin(), state.expected.end(), data)) {
+            throw std::runtime_error("io_uring probe returned invalid data");
+        }
+        state.completed = true;
+    };
+    aastore::IoUringStats stats;
+    std::string reason;
+    const std::vector<aastore::ByteRange> ranges{
+        {0, probe.expected.size(), 0, 1}};
+    if (!aastore::read_ranges_io_uring(
+            ::fileno(file.get()), ranges, 1, 1, nullptr, nullptr,
+            complete, &probe, stats, reason)) {
+        std::cout << "SKIP: explicit io_uring scenarios unavailable: " << reason
+                  << "; pread and Auto scenarios continue\n";
+        return false;
+    }
+    if (!probe.completed || stats.submissions != 1 || stats.completions != 1) {
+        throw std::runtime_error("io_uring probe did not complete its read");
+    }
+    return true;
+}
+
 // 混合前缀命中与磁盘请求，验证小队列下的协作解码、长序列、重复 ID 和输出顺序。
 void check_prefix_slices(const std::filesystem::path& root) {
     const auto fasta = root / "prefix_slices.fa";
@@ -335,6 +427,7 @@ void check_prefix_slices(const std::filesystem::path& root) {
 
 // 验证建库、文本列、各存储模式及单条、批量、顺序和流式读取行为。
 int main() {
+    check_worker_exception_cleanup();
     aastore::ByteArena moved_from_arena;
     moved_from_arena.resize_uninitialized(1024);
     aastore::ByteArena moved_arena(std::move(moved_from_arena));
@@ -345,9 +438,13 @@ int main() {
            "byte arena remains reusable after move");
 
     TempDir temp;
+#if defined(AASTORE_TEST_IO_URING)
+    const bool io_uring_available = probe_io_uring();
+#endif
+    check_even_record_metadata(temp.path());
     check_sequential_into_partitions(temp.path());
 #if defined(AASTORE_TEST_IO_URING)
-    check_prefix_slices(temp.path());
+    if (io_uring_available) check_prefix_slices(temp.path());
 #endif
     const std::filesystem::path fasta = temp.path() / "proteins.fa";
     constexpr size_t kLongTestResidues = 6553;
@@ -607,28 +704,30 @@ int main() {
     }
 
 #ifdef AASTORE_TEST_IO_URING
-    aastore::ReadOptions uring_options;
-    uring_options.collect_diagnostics = true;
-    uring_options.io_backend = aastore::IoBackend::IoUring;
-    uring_options.threads = 3;
-    uring_options.io_queue_depth = 4;
-    uring_options.merge_gap_bytes = 0;
-    const aastore::Batch uring_batch = store.batch_get(ids, uring_options);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        expect(uring_batch.view(i) == expected[ids[i]],
-               "io_uring batch preserves request order " +
-                   std::to_string(i));
+    if (io_uring_available) {
+        aastore::ReadOptions uring_options;
+        uring_options.collect_diagnostics = true;
+        uring_options.io_backend = aastore::IoBackend::IoUring;
+        uring_options.threads = 3;
+        uring_options.io_queue_depth = 4;
+        uring_options.merge_gap_bytes = 0;
+        const aastore::Batch uring_batch = store.batch_get(ids, uring_options);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            expect(uring_batch.view(i) == expected[ids[i]],
+                   "io_uring batch preserves request order " +
+                       std::to_string(i));
+        }
+        expect(uring_batch.stats.io_uring &&
+                   uring_batch.stats.io_submissions != 0 &&
+                   uring_batch.stats.io_completions != 0 &&
+                   uring_batch.stats.io_workers == 3 &&
+                   uring_batch.stats.decode_workers == 3 &&
+                   uring_batch.stats.workers == 3 &&
+                   uring_batch.stats.io_queue_depth <= 12 &&
+                   uring_batch.stats.io_submit_calls != 0 &&
+                   uring_batch.stats.io_empty_waits <= uring_batch.stats.io_wait_calls,
+               "explicit io_uring backend completes bounded requests");
     }
-    expect(uring_batch.stats.io_uring &&
-               uring_batch.stats.io_submissions != 0 &&
-               uring_batch.stats.io_completions != 0 &&
-               uring_batch.stats.io_workers == 3 &&
-               uring_batch.stats.decode_workers == 3 &&
-               uring_batch.stats.workers == 3 &&
-               uring_batch.stats.io_queue_depth <= 12 &&
-               uring_batch.stats.io_submit_calls != 0 &&
-               uring_batch.stats.io_empty_waits <= uring_batch.stats.io_wait_calls,
-           "explicit io_uring backend completes bounded requests");
 #endif
 
     // 对齐后 p0 与 p1 的起始位置相差一个 4 KiB packed 页。
@@ -775,7 +874,7 @@ int main() {
     std::vector<aastore::IoBackend> backends{
         aastore::IoBackend::Pread, aastore::IoBackend::Auto};
 #ifdef AASTORE_TEST_IO_URING
-    backends.push_back(aastore::IoBackend::IoUring);
+    if (io_uring_available) backends.push_back(aastore::IoBackend::IoUring);
 #endif
     const std::vector<std::vector<aastore::SequenceId>> thread_workloads = {
         mixed_prefix_ids, {1, 0, 1}, {3, 5, 7}, {}};

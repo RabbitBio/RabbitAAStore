@@ -39,13 +39,58 @@ src/store.cpp                  三种模式的 batch 编排、并行解码和 sc
 
 ## 构建
 
+支持 Linux、C++17 和 GCC/Clang。普通 C++ 构建不依赖 Python；liburing 是可选依赖。
+
 ```bash
-mkdir -p build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
-ctest --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 4
+ctest --test-dir build --output-on-failure
 ```
+
+顶层构建默认启用工具、基准和测试；通过 `add_subdirectory` 接入其他项目时，三者默认
+关闭。可分别用 `AASTORE_BUILD_TOOLS`、`AASTORE_BUILD_BENCHMARKS`、`AASTORE_BUILD_TESTS`
+覆盖默认值。仅构建并安装 C++ 库：
+
+```bash
+cmake -S . -B build-sdk -DCMAKE_BUILD_TYPE=Release \
+  -DAASTORE_BUILD_TOOLS=OFF -DAASTORE_BUILD_BENCHMARKS=OFF \
+  -DAASTORE_BUILD_TESTS=OFF
+cmake --build build-sdk -j 4
+cmake --install build-sdk --prefix "$HOME/.local"
+```
+
+默认构建静态库；`-DBUILD_SHARED_LIBS=ON` 构建共享库。安装内容包含公共头文件、库、
+CMake 包配置和 pkg-config 元数据。liburing 启用时，共享库运行环境需要对应运行库，
+静态库的下游链接需要对应开发库；安装的 CMake 包会为静态链接重新查找依赖。
+
+### 在其他 C++ 项目中使用
+
+安装后的项目通过 `find_package` 接入，编译标准、头文件路径和链接依赖由 target 传播：
+
+```cmake
+find_package(aastore 0.1 CONFIG REQUIRED)
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE aastore::aastore)
+```
+
+配置下游项目时通过 `-DCMAKE_PREFIX_PATH="$HOME/.local"` 指定安装前缀。
+自定义了非标准库目录时，也可用 `-Daastore_DIR=/path/to/libdir/cmake/aastore` 指定包配置目录。
+也可直接嵌入源码：
+
+```cmake
+add_subdirectory(path/to/AABinaryStoreV2)
+target_link_libraries(my_app PRIVATE aastore::aastore)
+```
+
+可独立编译和运行的示例位于 [examples/cpp](examples/cpp)：
+
+```bash
+cmake -S examples/cpp -B build-example -DCMAKE_PREFIX_PATH="$HOME/.local"
+cmake --build build-example -j 4
+ctest --test-dir build-example --output-on-failure
+```
+
+示例通过已安装的库建一个临时数据库、读取重复且乱序的 ID，并自动清理临时数据。
 
 ## Python 接口
 
@@ -57,11 +102,25 @@ python -m pip install .
 python tests/python_test.py
 ```
 
-如果安装了 liburing 开发包，扩展会支持 io_uring；否则 Auto 回退到 pread。
-需要明确禁用 io_uring 构建时：
+Python 包默认使用 pread，避免 wheel 依赖系统 liburing。需要在本机启用 io_uring 时，
+先安装 liburing 开发包，再显式配置：
 
 ```bash
-python -m pip install . -Ccmake.define.AASTORE_ENABLE_IO_URING=OFF
+python -m pip install . -Ccmake.define.AASTORE_ENABLE_IO_URING=ON
+```
+
+Python wheel 只安装 Python 扩展、模块和类型声明；C++ SDK 使用上述独立安装流程。
+本机启用 io_uring 构建的 wheel 可能依赖系统 `liburing`，运行时 Auto 回退无法解决
+动态库缺失导致的导入失败。手动触发仓库的 portable wheels 工作流可构建禁用 io_uring
+并经 auditwheel 处理的 Linux wheel；这些 wheel 使用 pread 后端。
+
+源码包也可独立重建：
+
+```bash
+python -m pip install build
+python -m build --sdist
+python -m pip wheel dist/aastore-0.1.0.tar.gz --no-deps -w dist \
+  -Ccmake.define.AASTORE_ENABLE_IO_URING=OFF
 ```
 
 Python 复用相同的 C++ 建库、编码和读取核心，不启动外部命令行程序：
@@ -427,3 +486,18 @@ FullMemory/NonFull 冷启动矩阵、计时口径和执行脚本见
 运行环境不支持时直接报错。读取线程统一由 `--threads` 设置，`--queue-depth` 默认 `64`。
 `--read-strategy sparse|scan` 可做同一 workload 的公平对照；输出中的
 `sparse_ranges`、`scan_ranges`、`read_bytes` 和 `overread_bytes` 用于检查 planner 决策。
+
+## 版本与维护
+
+当前版本由仓库根目录的 [VERSION](VERSION) 统一提供给 CMake 和 Python 包。
+0.x 阶段的 minor 更新可能修改公开 API；共享库 SONAME 包含 major 和 minor 版本。
+包版本与磁盘格式版本分别管理，更新包不自动意味着需要重建数据库。
+
+[CHANGELOG.md](CHANGELOG.md) 记录变更；[docs/releasing.md](docs/releasing.md) 说明兼容约定、
+安装后验证和发布检查。仓库 CI 检查静态/共享库、io_uring/pread 构建与 Python 源码包重建。
+portable wheels 工作流需要手动触发，只生成构建产物，不自动发布。
+
+## 许可证
+
+AAStore 采用 GNU General Public License version 3（`GPL-3.0-only`）。
+完整条款见 [LICENSE](LICENSE)。

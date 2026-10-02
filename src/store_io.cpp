@@ -142,6 +142,7 @@ void pread_exact_parallel(int descriptor, void* output, uint64_t bytes,
     }
 
     std::vector<std::thread> threads;
+    ThreadJoinGuard join_guard(threads);
     errors.resize(workers);
     threads.reserve(workers - 1);
     ctx.worker_count = workers;
@@ -149,7 +150,7 @@ void pread_exact_parallel(int descriptor, void* output, uint64_t bytes,
         threads.emplace_back(parallel_pread_worker, &ctx, worker);
     }
     parallel_pread_worker(&ctx, 0);
-    for (std::thread& thread : threads) thread.join();
+    join_guard.join_all();
     for (const std::exception_ptr& error : errors) {
         if (error) std::rethrow_exception(error);
     }

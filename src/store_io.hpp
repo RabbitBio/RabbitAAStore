@@ -4,6 +4,7 @@
 #define AASTORE_STORE_IO_HPP
 
 #include "byte_range_planner.hpp"
+#include "thread_helpers.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -58,12 +59,13 @@ void run_indexed_workers(size_t worker_count,
                          Context* context) {
     if (worker_count == 0) return;
     std::vector<std::thread> threads;
+    ThreadJoinGuard join_guard(threads);
     threads.reserve(worker_count - 1);
     for (size_t worker = 1; worker < worker_count; ++worker) {
         threads.emplace_back(worker_function, context, worker);
     }
     worker_function(context, 0);
-    for (std::thread& thread : threads) thread.join();
+    join_guard.join_all();
 }
 
 // 按线程索引执行可调用对象，调用线程参与工作；任务须自行处理跨线程异常。
@@ -71,6 +73,7 @@ template <typename Worker>
 void run_indexed_workers(size_t worker_count, Worker&& worker_function) {
     if (worker_count == 0) return;
     std::vector<std::thread> threads;
+    ThreadJoinGuard join_guard(threads);
     threads.reserve(worker_count - 1);
     for (size_t worker = 1; worker < worker_count; ++worker) {
         threads.emplace_back([&worker_function, worker]() {
@@ -78,7 +81,7 @@ void run_indexed_workers(size_t worker_count, Worker&& worker_function) {
         });
     }
     worker_function(0);
-    for (std::thread& thread : threads) thread.join();
+    join_guard.join_all();
 }
 
 // 在全部工作线程结束后，按槽位顺序重新抛出首个已记录的异常。
