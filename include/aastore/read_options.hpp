@@ -53,6 +53,9 @@ struct StoreOptions {
     size_t threads = 8;
     bool resident_names = false;
     bool resident_descriptions = false;
+
+    // 校验存储模式及前缀预算；零线程保留现有的单线程语义。
+    void validate() const;
 };
 
 enum class IoBackend : uint8_t {
@@ -95,6 +98,9 @@ struct ReadOptions {
     uint64_t scan_max_range_bytes = kScanMaxRangeBytes;
     // 收集阶段耗时和 submit/wait API 诊断计数；默认关闭，基本统计始终保留。
     bool collect_diagnostics = false;
+
+    // 拒绝未知后端或策略；零线程、零队列深度及零预算保留原有约定。
+    void validate() const;
 };
 
 // 一次序列批读的规划、前缀命中、I/O 和解码统计。

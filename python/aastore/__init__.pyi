@@ -52,6 +52,7 @@ class BuildOptions:
     write_descriptions: bool
     def __init__(self, *, threads: int = 1, overwrite: bool = False,
                  write_names: bool = True, write_descriptions: bool = True) -> None: ...
+    def validate(self) -> None: ...
 
 class StoreOptions:
     storage_mode: StorageMode
@@ -62,6 +63,7 @@ class StoreOptions:
     def __init__(self, *, storage_mode: StorageMode = StorageMode.ByteRange,
                  cache_bytes: int = 0, threads: int = 8,
                  resident_names: bool = False, resident_descriptions: bool = False) -> None: ...
+    def validate(self) -> None: ...
 
 class ReadOptions:
     threads: int
@@ -81,6 +83,7 @@ class ReadOptions:
                  merge_gap_bytes: int = 4096, max_merged_range_bytes: int = 16384,
                  max_exact_merged_range_bytes: int = 1048576, scan_max_range_bytes: int = 262144,
                  collect_diagnostics: bool = False) -> None: ...
+    def validate(self) -> None: ...
 
 # Result classes have no native constructor; the private NoReturn argument models this.
 class BuildStats:

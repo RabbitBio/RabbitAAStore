@@ -284,9 +284,12 @@ void check_even_record_metadata(const std::filesystem::path& root) {
 }
 
 // 让多个线程切入同一条长序列，并覆盖重复边界、前缀命中和跨调用暂存区复用。
-void check_sequential_into_partitions(const std::filesystem::path& root) {
-    const auto fasta = root / "sequential_partitions.fa";
-    const auto path = root / "sequential_partitions_store";
+void check_sequential_into_partitions(const std::filesystem::path& root,
+                                      bool concurrent) {
+    const auto fasta = root / (concurrent ? "sequential_concurrency.fa"
+                                         : "sequential_partitions.fa");
+    const auto path = root / (concurrent ? "sequential_concurrency_store"
+                                        : "sequential_partitions_store");
     const std::string alphabet = "ACDEFGHIKLMNPQRSTVWY";
     std::vector<std::string> expected{
         "", "ACD", "", "", std::string(9 * 1024 * 1024 + 17, 'A'),
@@ -310,13 +313,16 @@ void check_sequential_into_partitions(const std::filesystem::path& root) {
             : aastore::StorageMode::PrefixMemory;
         store_options.cache_bytes = budget;
         aastore::Store source(path, store_options);
-        for (size_t threads : {size_t{0}, size_t{1}, size_t{2}, size_t{4}, size_t{16}}) {
-            aastore::ReadOptions reads;
-            reads.threads = threads;
-            check_sequential_get_into(source, expected, 0, source.size(), reads);
-            check_sequential_get_into(source, expected, 2, source.size() - 2, reads);
-            check_sequential_get_into(source, expected, 6, source.size(), reads);
-            check_sequential_get_into(source, expected, 2, 4, reads);
+        if (!concurrent) {
+            for (size_t threads : {size_t{0}, size_t{1}, size_t{2}, size_t{4}, size_t{16}}) {
+                aastore::ReadOptions reads;
+                reads.threads = threads;
+                check_sequential_get_into(source, expected, 0, source.size(), reads);
+                check_sequential_get_into(source, expected, 2, source.size() - 2, reads);
+                check_sequential_get_into(source, expected, 6, source.size(), reads);
+                check_sequential_get_into(source, expected, 2, 4, reads);
+            }
+            continue;
         }
         std::array<bool, 4> concurrent_ok{};
         std::vector<std::thread> workers;
@@ -423,64 +429,81 @@ void check_prefix_slices(const std::filesystem::path& root) {
 }
 #endif
 
-}  // namespace
+constexpr size_t kLongTestResidues = 6553;
+constexpr uint64_t kPrefixCacheBytes = 4096;
 
-// 验证建库、文本列、各存储模式及单条、批量、顺序和流式读取行为。
-int main() {
-    check_worker_exception_cleanup();
-    aastore::ByteArena moved_from_arena;
-    moved_from_arena.resize_uninitialized(1024);
-    aastore::ByteArena moved_arena(std::move(moved_from_arena));
-    moved_from_arena.resize_uninitialized(512);
-    expect(moved_arena.size() == 1024 && moved_arena.data() != nullptr &&
-               moved_from_arena.size() == 512 &&
-               moved_from_arena.data() != nullptr,
-           "byte arena remains reusable after move");
+// 每次运行创建独立建库夹具，各组无需依赖其他测试先执行。
+struct StoreFixture {
+    StoreFixture() {
+        fasta = temp.path() / "proteins.fa";
+        const std::string long_filler(kLongTestResidues, 'A');
+        const std::string long_unaligned(kLongTestResidues + 17, 'W');
+        std::string oversized_line(4 * 1024 * 1024 + 17, 'C');
+        constexpr std::string_view oversized_alphabet =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ*-";
+        for (size_t i = 0; i < oversized_line.size(); ++i) {
+            oversized_line[i] = oversized_alphabet[i % oversized_alphabet.size()];
+        }
+        {
+            std::ofstream output(fasta);
+            output << ">empty\n"
+                   << ">p0 description\nac de\tfg?i\n"
+                   << ">filler1\n" << long_filler << "\n"
+                   << ">p1\nKLMNPQRS\n"
+                   << ">filler2\n" << long_filler << "\n"
+                   << ">p2\nTVWYBXZJ\n"
+                   << ">long\nACDEFGHIKLMNPQRSTVWY*--OU\n"
+                   << ">cross\n" << long_unaligned << "\n"
+                   << ">oversized\n" << oversized_line;
+        }
+        store_path = temp.path() / "store";
+        built =
+            aastore::build_fasta(fasta, store_path);
+        expected = {
+            "", "ACDEFGXI", long_filler, "KLMNPQRS", long_filler,
+            "TVWYBXZJ", "ACDEFGHIKLMNPQRSTVWY*--OU", long_unaligned,
+            oversized_line};
+        expected_names = {
+            "empty", "p0", "filler1", "p1", "filler2", "p2", "long",
+            "cross", "oversized"};
+        expected_descriptions = {
+            "", "description", "", "", "", "", "", "", ""};
+    }
+
+    void check_builder();
+    void check_random(bool io_uring_available);
+    void check_sequential();
+    void check_text();
+    void check_concurrency(bool io_uring_available);
 
     TempDir temp;
-#if defined(AASTORE_TEST_IO_URING)
-    const bool io_uring_available = probe_io_uring();
-#endif
+    std::filesystem::path fasta;
+    std::filesystem::path store_path;
+    aastore::BuildStats built;
+    std::vector<std::string> expected;
+    std::vector<std::string> expected_names;
+    std::vector<std::string> expected_descriptions;
+};
+
+// 驻留选项供相关组各自打开 Store，不共享运行时状态。
+aastore::StoreOptions full_store_options() {
+    aastore::StoreOptions options;
+    options.storage_mode = aastore::StorageMode::FullMemory;
+    options.threads = 2;
+    return options;
+}
+
+aastore::StoreOptions prefix_store_options() {
+    aastore::StoreOptions options;
+    options.storage_mode = aastore::StorageMode::PrefixMemory;
+    options.cache_bytes = kPrefixCacheBytes;
+    options.threads = 2;
+    return options;
+}
+
+// 建库格式、可选文本列、覆盖和空输入。
+void StoreFixture::check_builder() {
     check_even_record_metadata(temp.path());
-    check_sequential_into_partitions(temp.path());
-#if defined(AASTORE_TEST_IO_URING)
-    if (io_uring_available) check_prefix_slices(temp.path());
-#endif
-    const std::filesystem::path fasta = temp.path() / "proteins.fa";
-    constexpr size_t kLongTestResidues = 6553;
-    constexpr uint64_t kPrefixCacheBytes = 4096;
-    const std::string long_filler(kLongTestResidues, 'A');
-    const std::string long_unaligned(kLongTestResidues + 17, 'W');
-    std::string oversized_line(4 * 1024 * 1024 + 17, 'C');
-    constexpr std::string_view oversized_alphabet =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ*-";
-    for (size_t i = 0; i < oversized_line.size(); ++i) {
-        oversized_line[i] = oversized_alphabet[i % oversized_alphabet.size()];
-    }
-    {
-        std::ofstream output(fasta);
-        output << ">empty\n"
-               << ">p0 description\nac de\tfg?i\n"
-               << ">filler1\n" << long_filler << "\n"
-               << ">p1\nKLMNPQRS\n"
-               << ">filler2\n" << long_filler << "\n"
-               << ">p2\nTVWYBXZJ\n"
-               << ">long\nACDEFGHIKLMNPQRSTVWY*--OU\n"
-               << ">cross\n" << long_unaligned << "\n"
-               << ">oversized\n" << oversized_line;
-    }
-    const std::filesystem::path store_path = temp.path() / "store";
-    const aastore::BuildStats built =
-        aastore::build_fasta(fasta, store_path);
-    const std::vector<std::string> expected = {
-        "", "ACDEFGXI", long_filler, "KLMNPQRS", long_filler,
-        "TVWYBXZJ", "ACDEFGHIKLMNPQRSTVWY*--OU", long_unaligned,
-        oversized_line};
-    const std::vector<std::string> expected_names = {
-        "empty", "p0", "filler1", "p1", "filler2", "p2", "long",
-        "cross", "oversized"};
-    const std::vector<std::string> expected_descriptions = {
-        "", "description", "", "", "", "", "", "", ""};
     expect(built.sequences == expected.size(), "sequence count");
     expect(built.name_bytes == 43 && built.description_bytes == 11,
            "annotation byte counts");
@@ -527,6 +550,144 @@ int main() {
                metadata_name + " uses compact text offsets");
     }
 
+    const std::filesystem::path sequence_only_path =
+        temp.path() / "sequence_only_store";
+    aastore::BuildOptions sequence_only_options;
+    sequence_only_options.write_names = false;
+    sequence_only_options.write_descriptions = false;
+    const aastore::BuildStats sequence_only_built =
+        aastore::build_fasta(
+            fasta, sequence_only_path, sequence_only_options);
+    aastore::Store sequence_only_store(sequence_only_path);
+    expect(sequence_only_built.name_bytes == 0 &&
+               sequence_only_built.description_bytes == 0 &&
+               !sequence_only_store.has_names() &&
+               !sequence_only_store.has_descriptions() &&
+               !std::filesystem::exists(sequence_only_path / "names.bin") &&
+               !std::filesystem::exists(sequence_only_path / "names.meta") &&
+               !std::filesystem::exists(
+                   sequence_only_path / "descriptions.bin") &&
+               !std::filesystem::exists(
+                   sequence_only_path / "descriptions.meta") &&
+               sequence_only_store.get(1) == expected[1],
+           "sequence-only build omits both annotation columns");
+    bool annotation_rejected = false;
+    try {
+        (void)sequence_only_store.batch_get_records(
+            {1}, aastore::RecordFields::Name);
+    } catch (const std::runtime_error&) {
+        annotation_rejected = true;
+    }
+    expect(annotation_rejected,
+           "sequence-only stores report missing annotations on demand");
+
+    const std::filesystem::path names_only_path =
+        temp.path() / "names_only_store";
+    aastore::BuildOptions names_only_options;
+    names_only_options.write_descriptions = false;
+    const aastore::BuildStats names_only_built =
+        aastore::build_fasta(
+            fasta, names_only_path, names_only_options);
+    aastore::Store names_only_store(names_only_path);
+    const aastore::RecordBatch selected_names =
+        names_only_store.batch_get_records(
+            {1}, aastore::RecordFields::Name);
+    expect(names_only_built.name_bytes == 43 &&
+               names_only_built.description_bytes == 0 &&
+               names_only_store.has_names() &&
+               !names_only_store.has_descriptions() &&
+               selected_names.name_view(0) == "p0" &&
+               std::filesystem::exists(names_only_path / "names.bin") &&
+               !std::filesystem::exists(
+                   names_only_path / "descriptions.bin"),
+           "name-only build exposes only the name column");
+
+    const std::filesystem::path descriptions_only_path =
+        temp.path() / "descriptions_only_store";
+    aastore::BuildOptions descriptions_only_options;
+    descriptions_only_options.write_names = false;
+    descriptions_only_options.encode_threads = 4;
+    const aastore::BuildStats descriptions_only_built =
+        aastore::build_fasta(
+            fasta, descriptions_only_path, descriptions_only_options);
+    aastore::Store descriptions_only_store(descriptions_only_path);
+    const aastore::RecordBatch selected_descriptions =
+        descriptions_only_store.batch_get_records(
+            {1}, aastore::RecordFields::Description);
+    expect(descriptions_only_built.name_bytes == 0 &&
+               descriptions_only_built.description_bytes == 11 &&
+               !descriptions_only_store.has_names() &&
+               descriptions_only_store.has_descriptions() &&
+               selected_descriptions.description_view(0) == "description" &&
+               !std::filesystem::exists(
+                   descriptions_only_path / "names.bin") &&
+               std::filesystem::exists(
+                   descriptions_only_path / "descriptions.bin"),
+           "description-only build exposes only the description column");
+
+    bool zero_build_threads_rejected = false;
+    try {
+        aastore::BuildOptions invalid_build_options;
+        invalid_build_options.encode_threads = 0;
+        (void)aastore::build_fasta(
+            fasta, temp.path() / "invalid_threads_store",
+            invalid_build_options);
+    } catch (const std::invalid_argument&) {
+        zero_build_threads_rejected = true;
+    }
+    expect(zero_build_threads_rejected,
+           "builder rejects zero encoding threads");
+
+    names_only_options.overwrite = true;
+    names_only_options.write_names = false;
+    (void)aastore::build_fasta(
+        fasta, names_only_path, names_only_options);
+    aastore::Store overwritten_sequence_only(names_only_path);
+    expect(!overwritten_sequence_only.has_names() &&
+               !overwritten_sequence_only.has_descriptions() &&
+               !std::filesystem::exists(names_only_path / "names.bin") &&
+               !std::filesystem::exists(names_only_path / "names.meta"),
+           "overwrite removes annotation columns disabled by the new build");
+
+    const std::filesystem::path empty_fasta = temp.path() / "empty.fa";
+    {
+        std::ofstream output(empty_fasta);
+    }
+    const std::filesystem::path empty_store_path =
+        temp.path() / "empty_store";
+    const aastore::BuildStats empty_built =
+        aastore::build_fasta(empty_fasta, empty_store_path);
+    aastore::Store empty_store(empty_store_path);
+    expect(empty_built.sequences == 0 && empty_store.size() == 0 &&
+               empty_store.has_names() &&
+               empty_store.has_descriptions() &&
+               empty_store.batch_get_records({}).empty(),
+           "zero-record stores retain valid compact text columns");
+
+    bool overwrite_rejected = false;
+    try {
+        (void)aastore::build_fasta(fasta, store_path);
+    } catch (const std::runtime_error&) {
+        overwrite_rejected = true;
+    }
+    expect(overwrite_rejected, "overwrite is explicit");
+
+}
+
+// 随机读取、批次布局、规划、驻留模式及直接输出校验。
+void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
+    aastore::ByteArena moved_from_arena;
+    moved_from_arena.resize_uninitialized(1024);
+    aastore::ByteArena moved_arena(std::move(moved_from_arena));
+    moved_from_arena.resize_uninitialized(512);
+    expect(moved_arena.size() == 1024 && moved_arena.data() != nullptr &&
+               moved_from_arena.size() == 512 &&
+               moved_from_arena.data() != nullptr,
+           "byte arena remains reusable after move");
+
+#if defined(AASTORE_TEST_IO_URING)
+    if (io_uring_available) check_prefix_slices(temp.path());
+#endif
     aastore::Store store(store_path);
     expect(!aastore::ReadOptions{}.collect_diagnostics, "read diagnostics default to disabled");
     expect(aastore::ReadOptions{}.read_strategy ==
@@ -545,35 +706,6 @@ int main() {
         expect(store.sequence_length(i) == expected[i].size(),
                "sequence length " + std::to_string(i));
     }
-    aastore::ReadOptions sequential_options;
-    sequential_options.threads = 8;
-    const aastore::Batch sequential = store.sequential_get(
-        0, store.size(), sequential_options);
-    bool sequential_matches =
-        sequential.size() == expected.size() &&
-        sequential.storage.size() == built.residues &&
-        sequential.stats.requested_residues == built.residues;
-    for (size_t i = 0; i < expected.size(); ++i) {
-        sequential_matches = sequential_matches &&
-            sequential.view(i) == expected[i];
-    }
-    expect(sequential_matches,
-           "sequential get decodes one continuous ordered arena");
-
-    const aastore::Batch sequential_partial = store.sequential_get(
-        1, store.size() - 1, sequential_options);
-    bool sequential_partial_matches =
-        sequential_partial.size() == expected.size() - 2;
-    for (size_t i = 0; i < sequential_partial.size(); ++i) {
-        sequential_partial_matches = sequential_partial_matches &&
-            sequential_partial.view(i) == expected[i + 1];
-    }
-    expect(sequential_partial_matches,
-           "sequential get preserves partial range boundaries");
-
-    check_sequential_get_into(store, expected, 0, store.size(), sequential_options);
-    check_sequential_get_into(store, expected, 1, store.size() - 1, sequential_options);
-
     const std::vector<aastore::SequenceId> ids = {6, 1, 0, 3, 5, 1};
     const aastore::Batch batch = store.batch_get(ids);
     expect(batch.size() == ids.size(), "batch size");
@@ -596,40 +728,6 @@ int main() {
     expect(batch.view(0) == expected[ids[0]],
            "explicit view accessor remains zero-copy");
 
-    const aastore::RecordBatch records = store.batch_get_records(ids);
-    expect(records.size() == ids.size() && !records.empty() &&
-               records.fields() == aastore::RecordFields::All,
-           "record batch contains all requested fields");
-    for (size_t i = 0; i < ids.size(); ++i) {
-        expect(records.name_view(i) == expected_names[ids[i]],
-               "record batch name " + std::to_string(i));
-        expect(records.description_view(i) ==
-                   expected_descriptions[ids[i]],
-               "record batch description " + std::to_string(i));
-        expect(records.sequence_view(i) == expected[ids[i]],
-               "record batch sequence " + std::to_string(i));
-    }
-    expect(records.names.stats.requested_strings == ids.size() &&
-               records.names.stats.requested_bytes ==
-                   expected_names[6].size() + expected_names[1].size() +
-                       expected_names[0].size() + expected_names[3].size() +
-                       expected_names[5].size() + expected_names[1].size(),
-           "name column reports independent batch statistics");
-
-    const aastore::RecordBatch names_only = store.batch_get_records(
-        ids, aastore::RecordFields::Name);
-    expect(names_only.names.size() == ids.size() &&
-               names_only.descriptions.empty() &&
-               names_only.sequences.empty(),
-           "field mask avoids unused sequence and description reads");
-    bool missing_field_rejected = false;
-    try {
-        (void)names_only.sequence_view(0);
-    } catch (const std::logic_error&) {
-        missing_field_rejected = true;
-    }
-    expect(missing_field_rejected,
-           "record accessor rejects a field that was not requested");
     std::vector<aastore::SequenceId> planner_ids(70000);
     const std::vector<aastore::SequenceId> planner_pattern = {5, 1, 0, 6, 3};
     for (size_t i = 0; i < planner_ids.size(); ++i) {
@@ -783,13 +881,6 @@ int main() {
                full_batch.stats.read_bytes == 0 &&
                full_batch.stats.read_ns == 0,
            "full-memory batch bypasses sort, planning, and I/O");
-    const aastore::RecordBatch full_records = full_store.batch_get_records(
-        ids, aastore::RecordFields::Name |
-                 aastore::RecordFields::Sequence);
-    expect(full_records.name_view(0) == expected_names[ids[0]] &&
-               full_records.sequence_view(0) == expected[ids[0]] &&
-               full_records.sequences.stats.full_memory,
-           "record batch reuses the selected sequence storage mode");
     for (size_t i = 0; i < expected.size(); ++i) {
         expect(full_store.get(i) == expected[i],
                "full-memory single get " + std::to_string(i));
@@ -809,17 +900,6 @@ int main() {
         }
         expect(invalid_rejected, "single get_into rejects invalid IDs");
     }
-    std::array<bool, 8> concurrent_get_ok{};
-    std::vector<std::thread> get_workers;
-    ConcurrentGetContext get_ctx{
-        &full_store, &expected, &concurrent_get_ok};
-    for (size_t worker = 0; worker < concurrent_get_ok.size(); ++worker) {
-        get_workers.emplace_back(run_concurrent_get, &get_ctx, worker);
-    }
-    for (std::thread& worker : get_workers) worker.join();
-    expect(all_true(concurrent_get_ok.data(), concurrent_get_ok.size()),
-           "full-memory get_into shares only immutable data across threads");
-
     aastore::StoreOptions prefix_options;
     prefix_options.storage_mode = aastore::StorageMode::PrefixMemory;
     prefix_options.cache_bytes = kPrefixCacheBytes;
@@ -871,52 +951,7 @@ int main() {
                prefix_hits.stats.read_bytes == 0,
            "fully resident prefix batches bypass file reads");
 
-    std::vector<aastore::IoBackend> backends{
-        aastore::IoBackend::Pread, aastore::IoBackend::Auto};
-#ifdef AASTORE_TEST_IO_URING
-    if (io_uring_available) backends.push_back(aastore::IoBackend::IoUring);
-#endif
-    const std::vector<std::vector<aastore::SequenceId>> thread_workloads = {
-        mixed_prefix_ids, {1, 0, 1}, {3, 5, 7}, {}};
-    for (aastore::IoBackend backend : backends) {
-        for (size_t threads : {size_t{0}, size_t{1}, size_t{2}, size_t{8}}) {
-            aastore::ReadOptions options;
-            options.threads = threads;
-            options.io_backend = backend;
-            options.merge_gap_bytes = 0;
-            options.io_queue_depth = 2;
-            const size_t budget = std::max<size_t>(1, threads);
-            for (aastore::Store* source : {&store, &prefix_store, &full_store}) {
-                for (const auto& requested : thread_workloads) {
-                    const auto batch = check_batch_diagnostics(*source, requested, options);
-                    check_batch_get_into(*source, expected, requested, options);
-                    expect(batch.stats.workers <= budget,
-                           "batch workers stay within the total thread budget");
-                    for (size_t i = 0; i < requested.size(); ++i) {
-                        expect(batch.view(i) == expected[requested[i]],
-                               "thread counts preserve batch contents and order");
-                    }
-                    if (batch.stats.io_uring) {
-                        expect(batch.stats.io_workers == batch.stats.decode_workers &&
-                                   batch.stats.workers == batch.stats.io_workers &&
-                                   batch.stats.io_workers <= budget,
-                               "ring owners also decode prefix and disk data");
-                    }
-                }
-            }
-        }
-    }
     for (const aastore::Store* source : {&store, &prefix_store, &full_store}) {
-        check_batch_get_into(*source, expected, planner_ids, parallel_plan_options);
-        for (size_t threads : {size_t{0}, size_t{1}, size_t{2}, size_t{8}}) {
-            aastore::ReadOptions options;
-            options.threads = threads;
-            check_sequential_get_into(*source, expected, 0, source->size(), options);
-            check_sequential_get_into(*source, expected, 1, source->size() - 1, options);
-            check_sequential_get_into(*source, expected, source->size(), source->size(), options);
-            check_sequential_get_into(*source, expected, 0, 1, options);
-        }
-
         std::array<char, 16> guard;
         guard.fill('#');
         std::vector<char*> outputs{guard.data(), guard.data() + 8};
@@ -958,6 +993,78 @@ int main() {
                    zero_length_stats.ranges == 0,
                "direct batch accepts empty requests and null outputs for empty sequences");
 
+    }
+    const aastore::Batch empty = store.batch_get({});
+    expect(empty.empty() && empty.stats.ranges == 0,
+           "empty batch");
+    for (const aastore::Store* reader :
+         {&store, &full_store, &prefix_store}) {
+        std::string scratch;
+        for (size_t i = expected.size(); i-- != 0;) {
+            reader->get_into(i, scratch);
+            expect(scratch == expected[i],
+                   "single string reads preserve content");
+        }
+    }
+    bool rejected = false;
+    try {
+        (void)store.get(store.size());
+    } catch (const std::out_of_range&) {
+        rejected = true;
+    }
+    expect(rejected, "out-of-range id rejected");
+
+}
+
+// 连续区间、散布输出、长序列分区和驻留边界。
+void StoreFixture::check_sequential() {
+    check_sequential_into_partitions(temp.path(), false);
+    aastore::Store store(store_path);
+    aastore::Store full_store(store_path, full_store_options());
+    aastore::Store prefix_store(store_path, prefix_store_options());
+    aastore::ReadOptions sequential_options;
+    sequential_options.threads = 8;
+    const aastore::Batch sequential = store.sequential_get(
+        0, store.size(), sequential_options);
+    bool sequential_matches =
+        sequential.size() == expected.size() &&
+        sequential.storage.size() == built.residues &&
+        sequential.stats.requested_residues == built.residues;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        sequential_matches = sequential_matches &&
+            sequential.view(i) == expected[i];
+    }
+    expect(sequential_matches,
+           "sequential get decodes one continuous ordered arena");
+
+    const aastore::Batch sequential_partial = store.sequential_get(
+        1, store.size() - 1, sequential_options);
+    bool sequential_partial_matches =
+        sequential_partial.size() == expected.size() - 2;
+    for (size_t i = 0; i < sequential_partial.size(); ++i) {
+        sequential_partial_matches = sequential_partial_matches &&
+            sequential_partial.view(i) == expected[i + 1];
+    }
+    expect(sequential_partial_matches,
+           "sequential get preserves partial range boundaries");
+
+    check_sequential_get_into(store, expected, 0, store.size(), sequential_options);
+    check_sequential_get_into(store, expected, 1, store.size() - 1, sequential_options);
+
+    for (const aastore::Store* source : {&store, &prefix_store, &full_store}) {
+        for (size_t threads : {size_t{0}, size_t{1}, size_t{2}, size_t{8}}) {
+            aastore::ReadOptions options;
+            options.threads = threads;
+            check_sequential_get_into(*source, expected, 0, source->size(), options);
+            check_sequential_get_into(*source, expected, 1, source->size() - 1, options);
+            check_sequential_get_into(*source, expected, source->size(), source->size(), options);
+            check_sequential_get_into(*source, expected, 0, 1, options);
+        }
+
+        std::array<char, 16> guard;
+        guard.fill('#');
+        std::vector<char*> outputs{guard.data(), guard.data() + 8};
+        char* null_output = nullptr;
         bool sequential_count_rejected = false;
         try {
             source->sequential_get_into(1, 2, outputs);
@@ -1006,154 +1113,165 @@ int main() {
                "prefix sequential read crosses the resident boundary");
     }
 
-    const aastore::Batch empty = store.batch_get({});
-    expect(empty.empty() && empty.stats.ranges == 0,
-           "empty batch");
+}
+
+// 记录字段选择、文本列统计及未请求字段的访问错误。
+void StoreFixture::check_text() {
+    aastore::Store store(store_path);
+    aastore::Store full_store(store_path, full_store_options());
+    const std::vector<aastore::SequenceId> ids = {6, 1, 0, 3, 5, 1};
+    const aastore::RecordBatch records = store.batch_get_records(ids);
+    expect(records.size() == ids.size() && !records.empty() &&
+               records.fields() == aastore::RecordFields::All,
+           "record batch contains all requested fields");
+    for (size_t i = 0; i < ids.size(); ++i) {
+        expect(records.name_view(i) == expected_names[ids[i]],
+               "record batch name " + std::to_string(i));
+        expect(records.description_view(i) ==
+                   expected_descriptions[ids[i]],
+               "record batch description " + std::to_string(i));
+        expect(records.sequence_view(i) == expected[ids[i]],
+               "record batch sequence " + std::to_string(i));
+    }
+    expect(records.names.stats.requested_strings == ids.size() &&
+               records.names.stats.requested_bytes ==
+                   expected_names[6].size() + expected_names[1].size() +
+                       expected_names[0].size() + expected_names[3].size() +
+                       expected_names[5].size() + expected_names[1].size(),
+           "name column reports independent batch statistics");
+
+    const aastore::RecordBatch names_only = store.batch_get_records(
+        ids, aastore::RecordFields::Name);
+    expect(names_only.names.size() == ids.size() &&
+               names_only.descriptions.empty() &&
+               names_only.sequences.empty(),
+           "field mask avoids unused sequence and description reads");
+    bool missing_field_rejected = false;
+    try {
+        (void)names_only.sequence_view(0);
+    } catch (const std::logic_error&) {
+        missing_field_rejected = true;
+    }
+    expect(missing_field_rejected,
+           "record accessor rejects a field that was not requested");
+    const aastore::RecordBatch full_records = full_store.batch_get_records(
+        ids, aastore::RecordFields::Name |
+                 aastore::RecordFields::Sequence);
+    expect(full_records.name_view(0) == expected_names[ids[0]] &&
+               full_records.sequence_view(0) == expected[ids[0]] &&
+               full_records.sequences.stats.full_memory,
+           "record batch reuses the selected sequence storage mode");
     const aastore::RecordBatch empty_records = store.batch_get_records({});
     expect(empty_records.empty() && empty_records.names.empty() &&
                empty_records.descriptions.empty() &&
                empty_records.sequences.empty(),
            "empty record batch");
 
-    const std::filesystem::path sequence_only_path =
-        temp.path() / "sequence_only_store";
-    aastore::BuildOptions sequence_only_options;
-    sequence_only_options.write_names = false;
-    sequence_only_options.write_descriptions = false;
-    const aastore::BuildStats sequence_only_built =
-        aastore::build_fasta(
-            fasta, sequence_only_path, sequence_only_options);
-    aastore::Store sequence_only_store(sequence_only_path);
-    expect(sequence_only_built.name_bytes == 0 &&
-               sequence_only_built.description_bytes == 0 &&
-               !sequence_only_store.has_names() &&
-               !sequence_only_store.has_descriptions() &&
-               !std::filesystem::exists(sequence_only_path / "names.bin") &&
-               !std::filesystem::exists(sequence_only_path / "names.meta") &&
-               !std::filesystem::exists(
-                   sequence_only_path / "descriptions.bin") &&
-               !std::filesystem::exists(
-                   sequence_only_path / "descriptions.meta") &&
-               sequence_only_store.get(1) == expected[1],
-           "sequence-only build omits both annotation columns");
-    bool annotation_rejected = false;
-    try {
-        (void)sequence_only_store.batch_get_records(
-            {1}, aastore::RecordFields::Name);
-    } catch (const std::runtime_error&) {
-        annotation_rejected = true;
+}
+
+// 跨调用并发、总线程预算、并行直接输出和异常清理。
+void StoreFixture::check_concurrency([[maybe_unused]] bool io_uring_available) {
+    check_worker_exception_cleanup();
+    check_sequential_into_partitions(temp.path(), true);
+    aastore::Store store(store_path);
+    aastore::Store full_store(store_path, full_store_options());
+    aastore::Store prefix_store(store_path, prefix_store_options());
+    std::array<bool, 8> concurrent_get_ok{};
+    std::vector<std::thread> get_workers;
+    ConcurrentGetContext get_ctx{
+        &full_store, &expected, &concurrent_get_ok};
+    for (size_t worker = 0; worker < concurrent_get_ok.size(); ++worker) {
+        get_workers.emplace_back(run_concurrent_get, &get_ctx, worker);
     }
-    expect(annotation_rejected,
-           "sequence-only stores report missing annotations on demand");
+    for (std::thread& worker : get_workers) worker.join();
+    expect(all_true(concurrent_get_ok.data(), concurrent_get_ok.size()),
+           "full-memory get_into shares only immutable data across threads");
 
-    const std::filesystem::path names_only_path =
-        temp.path() / "names_only_store";
-    aastore::BuildOptions names_only_options;
-    names_only_options.write_descriptions = false;
-    const aastore::BuildStats names_only_built =
-        aastore::build_fasta(
-            fasta, names_only_path, names_only_options);
-    aastore::Store names_only_store(names_only_path);
-    const aastore::RecordBatch selected_names =
-        names_only_store.batch_get_records(
-            {1}, aastore::RecordFields::Name);
-    expect(names_only_built.name_bytes == 43 &&
-               names_only_built.description_bytes == 0 &&
-               names_only_store.has_names() &&
-               !names_only_store.has_descriptions() &&
-               selected_names.name_view(0) == "p0" &&
-               std::filesystem::exists(names_only_path / "names.bin") &&
-               !std::filesystem::exists(
-                   names_only_path / "descriptions.bin"),
-           "name-only build exposes only the name column");
-
-    const std::filesystem::path descriptions_only_path =
-        temp.path() / "descriptions_only_store";
-    aastore::BuildOptions descriptions_only_options;
-    descriptions_only_options.write_names = false;
-    descriptions_only_options.encode_threads = 4;
-    const aastore::BuildStats descriptions_only_built =
-        aastore::build_fasta(
-            fasta, descriptions_only_path, descriptions_only_options);
-    aastore::Store descriptions_only_store(descriptions_only_path);
-    const aastore::RecordBatch selected_descriptions =
-        descriptions_only_store.batch_get_records(
-            {1}, aastore::RecordFields::Description);
-    expect(descriptions_only_built.name_bytes == 0 &&
-               descriptions_only_built.description_bytes == 11 &&
-               !descriptions_only_store.has_names() &&
-               descriptions_only_store.has_descriptions() &&
-               selected_descriptions.description_view(0) == "description" &&
-               !std::filesystem::exists(
-                   descriptions_only_path / "names.bin") &&
-               std::filesystem::exists(
-                   descriptions_only_path / "descriptions.bin"),
-           "description-only build exposes only the description column");
-
-    bool zero_build_threads_rejected = false;
-    try {
-        aastore::BuildOptions invalid_build_options;
-        invalid_build_options.encode_threads = 0;
-        (void)aastore::build_fasta(
-            fasta, temp.path() / "invalid_threads_store",
-            invalid_build_options);
-    } catch (const std::invalid_argument&) {
-        zero_build_threads_rejected = true;
-    }
-    expect(zero_build_threads_rejected,
-           "builder rejects zero encoding threads");
-
-    names_only_options.overwrite = true;
-    names_only_options.write_names = false;
-    (void)aastore::build_fasta(
-        fasta, names_only_path, names_only_options);
-    aastore::Store overwritten_sequence_only(names_only_path);
-    expect(!overwritten_sequence_only.has_names() &&
-               !overwritten_sequence_only.has_descriptions() &&
-               !std::filesystem::exists(names_only_path / "names.bin") &&
-               !std::filesystem::exists(names_only_path / "names.meta"),
-           "overwrite removes annotation columns disabled by the new build");
-
-    const std::filesystem::path empty_fasta = temp.path() / "empty.fa";
-    {
-        std::ofstream output(empty_fasta);
-    }
-    const std::filesystem::path empty_store_path =
-        temp.path() / "empty_store";
-    const aastore::BuildStats empty_built =
-        aastore::build_fasta(empty_fasta, empty_store_path);
-    aastore::Store empty_store(empty_store_path);
-    expect(empty_built.sequences == 0 && empty_store.size() == 0 &&
-               empty_store.has_names() &&
-               empty_store.has_descriptions() &&
-               empty_store.batch_get_records({}).empty(),
-           "zero-record stores retain valid compact text columns");
-
-    for (const aastore::Store* reader :
-         {&store, &full_store, &prefix_store}) {
-        std::string scratch;
-        for (size_t i = expected.size(); i-- != 0;) {
-            reader->get_into(i, scratch);
-            expect(scratch == expected[i],
-                   "single string reads preserve content");
+    const std::vector<aastore::SequenceId> mixed_prefix_ids = {7, 1, 2, 7, 0, 1, 5};
+    std::vector<aastore::IoBackend> backends{
+        aastore::IoBackend::Pread, aastore::IoBackend::Auto};
+#ifdef AASTORE_TEST_IO_URING
+    if (io_uring_available) backends.push_back(aastore::IoBackend::IoUring);
+#endif
+    const std::vector<std::vector<aastore::SequenceId>> thread_workloads = {
+        mixed_prefix_ids, {1, 0, 1}, {3, 5, 7}, {}};
+    for (aastore::IoBackend backend : backends) {
+        for (size_t threads : {size_t{0}, size_t{1}, size_t{2}, size_t{8}}) {
+            aastore::ReadOptions options;
+            options.threads = threads;
+            options.io_backend = backend;
+            options.merge_gap_bytes = 0;
+            options.io_queue_depth = 2;
+            const size_t budget = std::max<size_t>(1, threads);
+            for (aastore::Store* source : {&store, &prefix_store, &full_store}) {
+                for (const auto& requested : thread_workloads) {
+                    const auto batch = check_batch_diagnostics(*source, requested, options);
+                    check_batch_get_into(*source, expected, requested, options);
+                    expect(batch.stats.workers <= budget,
+                           "batch workers stay within the total thread budget");
+                    for (size_t i = 0; i < requested.size(); ++i) {
+                        expect(batch.view(i) == expected[requested[i]],
+                               "thread counts preserve batch contents and order");
+                    }
+                    if (batch.stats.io_uring) {
+                        expect(batch.stats.io_workers == batch.stats.decode_workers &&
+                                   batch.stats.workers == batch.stats.io_workers &&
+                                   batch.stats.io_workers <= budget,
+                               "ring owners also decode prefix and disk data");
+                    }
+                }
+            }
         }
     }
-    bool rejected = false;
-    try {
-        (void)store.get(store.size());
-    } catch (const std::out_of_range&) {
-        rejected = true;
+    std::vector<aastore::SequenceId> planner_ids(70000);
+    const std::vector<aastore::SequenceId> planner_pattern = {5, 1, 0, 6, 3};
+    for (size_t i = 0; i < planner_ids.size(); ++i) {
+        planner_ids[i] = planner_pattern[i % planner_pattern.size()];
     }
-    expect(rejected, "out-of-range id rejected");
-
-    bool overwrite_rejected = false;
-    try {
-        (void)aastore::build_fasta(fasta, store_path);
-    } catch (const std::runtime_error&) {
-        overwrite_rejected = true;
+    aastore::ReadOptions parallel_plan_options;
+    parallel_plan_options.io_backend = aastore::IoBackend::Pread;
+    parallel_plan_options.threads = 8;
+    for (const aastore::Store* source : {&store, &prefix_store, &full_store}) {
+        check_batch_get_into(*source, expected, planner_ids, parallel_plan_options);
     }
-    expect(overwrite_rejected, "overwrite is explicit");
+}
 
+}  // namespace
+
+// 不带参数保留完整套件；CTest 按组运行，允许单独重现某一类失败。
+int main(int argc, char* argv[]) {
+    const std::array<std::string_view, 5> groups{
+        "builder", "random", "sequential", "text", "concurrency"};
+    std::string_view selected;
+    if (argc != 1) {
+        if (argc == 2 && std::string_view(argv[1]) == "--help") {
+            std::cout << "Usage: aastore_test [--group <builder|random|sequential|text|concurrency>]\n";
+            return 0;
+        }
+        if (argc != 3 || std::string_view(argv[1]) != "--group" ||
+            std::find(groups.begin(), groups.end(), std::string_view(argv[2])) == groups.end()) {
+            std::cerr << "Usage: aastore_test [--group <builder|random|sequential|text|concurrency>]\n";
+            return 2;
+        }
+        selected = argv[2];
+    }
+
+    bool io_uring_available = false;
+#if defined(AASTORE_TEST_IO_URING)
+    if (selected.empty() || selected == "random" || selected == "concurrency") {
+        io_uring_available = probe_io_uring();
+    }
+#endif
+    StoreFixture fixture;
+    for (const auto group : groups) {
+        if (!selected.empty() && selected != group) continue;
+        std::cout << "aastore test group: " << group << '\n';
+        if (group == "builder") fixture.check_builder();
+        else if (group == "random") fixture.check_random(io_uring_available);
+        else if (group == "sequential") fixture.check_sequential();
+        else if (group == "text") fixture.check_text();
+        else fixture.check_concurrency(io_uring_available);
+    }
     if (failures != 0) {
         std::cerr << "aastore test: " << failures << " failure(s)\n";
         return 1;

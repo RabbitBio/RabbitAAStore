@@ -44,7 +44,15 @@ src/store.cpp                  三种模式的 batch 编排、并行解码和 sc
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 4
-ctest --test-dir build --output-on-failure
+(cd build && ctest --output-on-failure)
+```
+
+Store 测试按 `builder`、`random`、`sequential`、`text`、`concurrency` 分组，可单独
+选择；`options` 检查配置校验。默认测试命令仍运行全部测试：
+
+```bash
+(cd build && ctest -L sequential --output-on-failure)
+./build/aastore_test --group text
 ```
 
 顶层构建默认启用工具、基准和测试；通过 `add_subdirectory` 接入其他项目时，三者默认
@@ -87,7 +95,7 @@ target_link_libraries(my_app PRIVATE aastore::aastore)
 ```bash
 cmake -S examples/cpp -B build-example -DCMAKE_PREFIX_PATH="$HOME/.local"
 cmake --build build-example -j 4
-ctest --test-dir build-example --output-on-failure
+(cd build-example && ctest --output-on-failure)
 ```
 
 示例通过已安装的库建一个临时数据库、读取重复且乱序的 ID，并自动清理临时数据。

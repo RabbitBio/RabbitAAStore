@@ -133,6 +133,95 @@ class PythonInterfaceTest(unittest.TestCase):
             with self.assertRaises(TypeError):
                 options_type(unknown_option=True)
 
+    # 无效配置在空请求和各读取路径上都被拒绝，且不创建库或修改输出。
+    def test_option_validation(self):
+        for options_type in (aastore.BuildOptions, aastore.StoreOptions, aastore.ReadOptions):
+            self.assertIsNone(options_type().validate())
+
+        build = aastore.BuildOptions()
+        build.threads = 0
+        with self.assertRaises(ValueError):
+            build.validate()
+        output_path = self.root / "invalid-options-store"
+        with self.assertRaises(ValueError):
+            aastore.build_fasta(self.root / "missing.fasta", output_path, build)
+        self.assertFalse(output_path.exists())
+        with self.assertRaises(ValueError):
+            aastore.build_fasta(self.fasta, output_path, threads=0)
+        self.assertFalse(output_path.exists())
+
+        for mode in (aastore.StorageMode(2), aastore.StorageMode(99),
+                     aastore.StorageMode.PrefixMemory):
+            options = aastore.StoreOptions()
+            options.storage_mode = mode
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    options.validate()
+                for path in (self.path, self.root / "missing-store"):
+                    with self.assertRaises(ValueError):
+                        aastore.Store(path, options)
+
+        for mode in (aastore.StorageMode.ByteRange, aastore.StorageMode.PrefixMemory,
+                     aastore.StorageMode.FullMemory):
+            with self.open_store(mode) as store:
+                for field, value in (("io_backend", aastore.IoBackend(99)),
+                                     ("read_strategy", aastore.ReadStrategy(99))):
+                    options = aastore.ReadOptions(io_backend=aastore.IoBackend.Pread)
+                    setattr(options, field, value)
+                    with self.subTest(mode=mode, invalid_field=field):
+                        with self.assertRaises(ValueError):
+                            options.validate()
+                        for ids in ([1], []):
+                            with self.assertRaises(ValueError):
+                                store.batch_get(ids, options)
+                            for fields in (aastore.RecordFields.None_, aastore.RecordFields.Name,
+                                           aastore.RecordFields.Description, aastore.RecordFields.Sequence,
+                                           aastore.RecordFields.All):
+                                with self.assertRaises(ValueError):
+                                    store.batch_get_records(ids, fields, options)
+                            buffers = [bytearray(b"#" * len(self.sequences[i])) for i in ids]
+                            with self.assertRaises(ValueError):
+                                store.batch_get_into(ids, buffers, options)
+                            self.assertEqual(buffers, [b"#" * len(self.sequences[i]) for i in ids])
+                        for end in (1, 2):
+                            with self.assertRaises(ValueError):
+                                store.sequential_get(1, end, options)
+                            buffers = [bytearray(b"#" * len(self.sequences[i])) for i in range(1, end)]
+                            with self.assertRaises(ValueError):
+                                store.sequential_get_into(1, end, buffers, options)
+                            self.assertEqual(buffers, [b"#" * len(self.sequences[i]) for i in range(1, end)])
+
+    # 保留零线程、零队列和零预算的既有语义，校验不负责探测后端可用性。
+    def test_zero_option_budgets(self):
+        options = aastore.ReadOptions(
+            threads=0, io_queue_depth=0, io_buffer_bytes=0, input_sorted=True,
+            merge_gap_bytes=0, max_merged_range_bytes=0,
+            max_exact_merged_range_bytes=0, scan_max_range_bytes=0,
+        )
+        for backend in (aastore.IoBackend.Auto, aastore.IoBackend.Pread, aastore.IoBackend.IoUring):
+            for strategy in (aastore.ReadStrategy.Sparse, aastore.ReadStrategy.Scan):
+                options.io_backend = backend
+                options.read_strategy = strategy
+                self.assertIsNone(options.validate())
+        options.io_backend = aastore.IoBackend.Pread
+        ids = [1, 1, 3, 5]
+        expected = [self.sequences[i] for i in ids]
+        for mode in (aastore.StorageMode.ByteRange, aastore.StorageMode.PrefixMemory,
+                     aastore.StorageMode.FullMemory):
+            store_options = aastore.StoreOptions(
+                storage_mode=mode, cache_bytes=1 if mode == aastore.StorageMode.PrefixMemory else 0,
+                threads=0,
+            )
+            self.assertIsNone(store_options.validate())
+            with aastore.Store(self.path, store_options) as store:
+                for strategy in (aastore.ReadStrategy.Sparse, aastore.ReadStrategy.Scan):
+                    options.read_strategy = strategy
+                    self.assertEqual(list(store.batch_get(ids, options)), expected)
+                    self.assertEqual(list(store.sequential_get(3, 6, options)), self.sequences[3:6])
+                    buffers = [bytearray(len(sequence)) for sequence in expected]
+                    store.batch_get_into(ids, buffers, options)
+                    self.assertEqual(buffers, [sequence.encode() for sequence in expected])
+
     # 覆盖各驻留模式、后端与线程预算，比较索引、切片、顺读和诊断结果。
     def test_reads(self):
         ids = [130, 1, 0, 6, 2, 6, 4, 11]

@@ -418,8 +418,10 @@ struct Store::Impl {
 
 // 打开给定路径的存储并按选项初始化其内部实现。
 Store::Store(const std::filesystem::path& path,
-             const StoreOptions& options)
-    : impl_(std::make_unique<Impl>(path, options)) {}
+             const StoreOptions& options) {
+    options.validate();
+    impl_ = std::make_unique<Impl>(path, options);
+}
 
 // 销毁 Store 及其持有的文件和缓存资源。
 Store::~Store() = default;
@@ -492,6 +494,7 @@ void Store::get_into(SequenceId id, std::string& output) const {
 // 按请求顺序批量读取并返回序列。
 Batch Store::batch_get(const std::vector<SequenceId>& ids,
                        const ReadOptions& options) const {
+    options.validate();
     return impl_->batch_get(ids, options);
 }
 
@@ -499,6 +502,7 @@ Batch Store::batch_get(const std::vector<SequenceId>& ids,
 BatchStats Store::batch_get_into(const std::vector<SequenceId>& ids,
                                  char* const* outputs, size_t output_count,
                                  const ReadOptions& options) const {
+    options.validate();
     return impl_->batch_get_into(ids, outputs, output_count, options);
 }
 
@@ -513,6 +517,7 @@ BatchStats Store::batch_get_into(const std::vector<SequenceId>& ids,
 Batch Store::sequential_get(SequenceId first_sequence,
                             SequenceId end_sequence,
                             const ReadOptions& options) const {
+    options.validate();
     return impl_->sequential_get(
         first_sequence, end_sequence, options);
 }
@@ -522,6 +527,7 @@ BatchStats Store::sequential_get_into(SequenceId first_sequence,
                                       SequenceId end_sequence,
                                       char* const* outputs, size_t output_count,
                                       const ReadOptions& options) const {
+    options.validate();
     return impl_->sequential_get_into(
         first_sequence, end_sequence, outputs, output_count, options);
 }
@@ -540,6 +546,7 @@ RecordBatch Store::batch_get_records(
         const std::vector<SequenceId>& ids,
         RecordFields fields,
         const ReadOptions& options) const {
+    options.validate();
     constexpr uint8_t known_fields =
         static_cast<uint8_t>(RecordFields::All);
     if ((static_cast<uint8_t>(fields) & ~known_fields) != 0) {

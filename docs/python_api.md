@@ -42,8 +42,15 @@ cmake -S . -B build-python -DAASTORE_BUILD_PYTHON=ON \
   -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
   -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
 cmake --build build-python -j 8
-ctest --test-dir build-python --output-on-failure
+(cd build-python && ctest --output-on-failure)
 ```
+
+直接构建支持 CMake 3.16 及以上。3.16/3.17 使用 `Development` 查找组件，
+需要 Python 开发头文件和开发库；3.18 及以上使用 `Development.Module`，
+只要求扩展模块所需的开发文件。旧 CMake 未设置 `Python_ROOT_DIR` 时，会用所选
+解释器的 `sys.base_prefix` 查找开发文件，也支持缺少 `distutils` 的新版本 Python
+虚拟环境。非标准安装仍可显式指定 `Python_ROOT_DIR` 或 `Python_INCLUDE_DIR`、
+`Python_LIBRARY`。
 
 `build_fasta(fasta, store, ...)` 接受路径字符串或 `pathlib.Path`，输入为 FASTA 文件，
 输出为 AAStore 库目录。序列 ID 按输入记录顺序从 `0` 开始分配，空序列也占一个 ID。
@@ -70,6 +77,12 @@ with TemporaryDirectory(prefix="aastore-guide-") as temporary:
 
 选项对象的构造参数均为关键字参数，字段可修改。建库和读取调用会取得自己的选项副本；
 修改原对象不会改变已经开始的原生调用。
+
+三个选项类均提供 `validate()`，可在使用前主动检查；成功返回 `None`，无效配置抛出
+`ValueError`，且不会修改选项。选项字段可分步配置；建库、开库和读取入口会重新校验，
+因此修改后无需依赖之前的校验结果，空请求和空区间也会校验。
+未知的存储模式、I/O 后端或读取策略会被拒绝；建库线程须大于零，
+`PrefixMemory` 的 `cache_bytes` 须大于零。读取参数中已有的零值约定保持有效。
 
 ### `BuildOptions`：哪些数据写入库
 

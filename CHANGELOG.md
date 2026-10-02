@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Centralize option validation and reject unknown storage modes, I/O backends,
+  and read strategies before file access or output writes, including empty reads.
+- Expose optional `validate()` checks for C++ and Python configuration objects
+  while preserving documented zero-valued read budgets and thread settings.
+- Select Python development components compatible with CMake 3.16/3.17.
+- Split Store tests into independently selectable CTest groups.
 - Expose owner-preserving, read-only `offsets` and `lengths` memoryviews for
   Python sequence and text batches, using native uint64 byte coordinates.
 - Match Python statistics type declarations to their read-only runtime fields.

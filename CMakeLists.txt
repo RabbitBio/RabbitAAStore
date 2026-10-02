@@ -60,6 +60,7 @@ add_library(aastore
     src/fasta_reader.cpp
     src/io_uring_backend.cpp
     src/metadata.cpp
+    src/options.cpp
     src/store_batch.cpp
     src/store.cpp
     src/store_io.cpp
@@ -175,7 +176,30 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/aastore.pc"
 
 if(AASTORE_BUILD_PYTHON)
     set(PYBIND11_FINDPYTHON ON)
-    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+    # FindPython split Development.Module from Development in CMake 3.18.
+    # Match pybind11's fallback so direct builds work with our 3.16 minimum.
+    if(CMAKE_VERSION VERSION_LESS 3.18)
+        find_package(Python 3.9 COMPONENTS Interpreter REQUIRED)
+        # Old FindPython uses distutils, absent from Python 3.12+. In a venv,
+        # point its development-file search at the interpreter's base install.
+        if(NOT DEFINED Python_ROOT_DIR AND NOT DEFINED ENV{Python_ROOT_DIR}
+           AND NOT CMAKE_CROSSCOMPILING)
+            execute_process(
+                COMMAND "${Python_EXECUTABLE}" -c "import sys; print(sys.base_prefix)"
+                OUTPUT_VARIABLE _aastore_python_root
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _aastore_python_root_result
+                ERROR_QUIET)
+            if(_aastore_python_root_result EQUAL 0)
+                set(Python_ROOT_DIR "${_aastore_python_root}")
+            endif()
+            unset(_aastore_python_root)
+            unset(_aastore_python_root_result)
+        endif()
+        find_package(Python 3.9 COMPONENTS Interpreter Development REQUIRED)
+    else()
+        find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
+    endif()
     find_package(pybind11 3.0 CONFIG REQUIRED)
     pybind11_add_module(_aastore NO_EXTRAS python/bindings.cpp)
     target_link_libraries(_aastore PRIVATE aastore)
@@ -228,7 +252,17 @@ if(AASTORE_BUILD_TESTS)
     endif()
     add_executable(aastore_test tests/store_test.cpp)
     target_link_libraries(aastore_test PRIVATE aastore)
-    add_test(NAME aastore_test COMMAND aastore_test)
+    add_executable(aastore_options_test tests/options_test.cpp)
+    target_link_libraries(aastore_options_test PRIVATE aastore)
+    add_test(NAME aastore_options_test COMMAND aastore_options_test)
+    set_tests_properties(aastore_options_test PROPERTIES LABELS "options")
+    foreach(_aastore_group IN ITEMS builder random sequential text concurrency)
+        add_test(NAME aastore_store_${_aastore_group}
+            COMMAND aastore_test --group ${_aastore_group})
+        set_tests_properties(aastore_store_${_aastore_group} PROPERTIES
+            LABELS "store;${_aastore_group}")
+    endforeach()
+    unset(_aastore_group)
     add_executable(aastore_codec_test tests/codec_test.cpp)
     target_link_libraries(aastore_codec_test PRIVATE aastore)
     add_test(NAME aastore_codec_test COMMAND aastore_codec_test)

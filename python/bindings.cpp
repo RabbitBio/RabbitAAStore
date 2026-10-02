@@ -240,6 +240,7 @@ struct WritableOutputs {
 BatchStats batch_into(const PythonStore& self, const std::vector<SequenceId>& ids,
                        const py::iterable& outputs, ReadOptions options) {
     const auto store = self.acquire();
+    options.validate();
     WritableOutputs prepared(request_lengths(*store, ids), outputs);
     py::gil_scoped_release release;
     return store->batch_get_into(ids, prepared.pointers, options);
@@ -249,6 +250,7 @@ BatchStats batch_into(const PythonStore& self, const std::vector<SequenceId>& id
 BatchStats sequential_into(const PythonStore& self, SequenceId begin, SequenceId end,
                             const py::iterable& outputs, ReadOptions options) {
     const auto store = self.acquire();
+    options.validate();
     WritableOutputs prepared(interval_lengths(*store, begin, end), outputs);
     py::gil_scoped_release release;
     return store->sequential_get_into(begin, end, prepared.pointers, options);
@@ -305,6 +307,8 @@ void bind_options(py::module_& module) {
             return BuildOptions{overwrite, names, descriptions, threads};
         }), py::kw_only(), py::arg("threads") = 1, py::arg("overwrite") = false,
             py::arg("write_names") = true, py::arg("write_descriptions") = true)
+        .def("validate", &BuildOptions::validate,
+             "Validate build settings without changing them; invalid settings raise ValueError.")
         .def_readwrite("threads", &BuildOptions::encode_threads)
         .def_readwrite("overwrite", &BuildOptions::overwrite)
         .def_readwrite("write_names", &BuildOptions::write_names)
@@ -315,6 +319,8 @@ void bind_options(py::module_& module) {
         }), py::kw_only(), py::arg("storage_mode") = StorageMode::ByteRange,
             py::arg("cache_bytes") = 0, py::arg("threads") = 8,
             py::arg("resident_names") = false, py::arg("resident_descriptions") = false)
+        .def("validate", &StoreOptions::validate,
+             "Validate storage settings without opening files; invalid settings raise ValueError.")
         .def_readwrite("storage_mode", &StoreOptions::storage_mode)
         .def_readwrite("cache_bytes", &StoreOptions::cache_bytes)
         .def_readwrite("threads", &StoreOptions::threads)
@@ -334,6 +340,8 @@ void bind_options(py::module_& module) {
             py::arg("max_exact_merged_range_bytes") = kMaxExactMergedRangeBytes,
             py::arg("scan_max_range_bytes") = kScanMaxRangeBytes,
             py::arg("collect_diagnostics") = false)
+        .def("validate", &ReadOptions::validate,
+             "Validate backend and strategy; documented zero-valued budgets remain valid.")
 #define READ_OPTION(field) .def_readwrite(#field, &ReadOptions::field)
         READ_OPTION(threads) READ_OPTION(io_backend) READ_OPTION(io_queue_depth)
         READ_OPTION(io_buffer_bytes) READ_OPTION(input_sorted) READ_OPTION(read_strategy)
