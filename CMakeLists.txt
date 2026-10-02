@@ -5,6 +5,7 @@ cmake_minimum_required(VERSION 3.16)
 project(AABinaryStoreByteRange VERSION 0.1.0 LANGUAGES CXX)
 
 option(AASTORE_BUILD_TESTS "Build AAStore tests" ON)
+option(AASTORE_BUILD_PYTHON "Build the Python bindings" OFF)
 option(AASTORE_ENABLE_IO_URING "Enable the Linux io_uring read backend" ON)
 set(AASTORE_IPO_DEFAULT ON)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
@@ -64,6 +65,21 @@ if(AASTORE_ENABLE_IPO AND AASTORE_IPO_SUPPORTED)
     set_property(TARGET aastore PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
+if(AASTORE_BUILD_PYTHON)
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+    find_package(pybind11 3.0 CONFIG REQUIRED)
+    set_property(TARGET aastore PROPERTY POSITION_INDEPENDENT_CODE ON)
+    pybind11_add_module(_aastore NO_EXTRAS python/bindings.cpp)
+    target_link_libraries(_aastore PRIVATE aastore)
+    target_compile_definitions(_aastore PRIVATE
+        AASTORE_PYTHON_VERSION="${PROJECT_VERSION}")
+    set_target_properties(_aastore PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/python/aastore")
+    configure_file(python/aastore/__init__.py python/aastore/__init__.py COPYONLY)
+    install(TARGETS _aastore LIBRARY DESTINATION aastore)
+endif()
+
 add_executable(aastore_bench benchmarks/read_benchmark.cpp)
 target_link_libraries(aastore_bench PRIVATE aastore)
 
@@ -88,6 +104,12 @@ target_link_libraries(aastore_window_bench PRIVATE aastore)
 
 if(AASTORE_BUILD_TESTS)
     enable_testing()
+    if(AASTORE_BUILD_PYTHON)
+        add_test(NAME aastore_python_test
+            COMMAND ${CMAKE_COMMAND} -E env
+                "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python"
+                ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/python_test.py)
+    endif()
     add_executable(aastore_test tests/store_test.cpp)
     target_link_libraries(aastore_test PRIVATE aastore)
     if(AASTORE_HAVE_IO_URING)

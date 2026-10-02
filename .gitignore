@@ -27,3 +27,10 @@ Testing/
 .vscode/
 *~
 .DS_Store
+
+# Python packaging and bytecode
+/dist/
+/.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
