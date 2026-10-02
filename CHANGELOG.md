@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Expose owner-preserving, read-only `offsets` and `lengths` memoryviews for
+  Python sequence and text batches, using native uint64 byte coordinates.
+- Match Python statistics type declarations to their read-only runtime fields.
+- Describe pybind11 enums, positional record accessors, and nonconstructible
+  result types accurately in Python type declarations.
+- Add a practical Python API guide and self-contained examples for records,
+  batch buffer layouts, and reusable output buffers; run the examples in CI.
+- Cover Python batch layout lifetimes, UTF-8 byte boundaries, Scan reads,
+  sorted requests, and range budgets with installed-package tests.
 - Add an installable C++ SDK with the `aastore::aastore` CMake target,
   relocatable package configuration, package version checks, and pkg-config metadata.
 - Separate library, command-line tool, benchmark, and test build options;

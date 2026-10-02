@@ -121,4 +121,9 @@ jobs:
           assert "liburing" not in dependencies
           PY
       - name: Test the installed wheel
-        run: python tests/python_test.py
+        run: |
+          source_dir="$GITHUB_WORKSPACE/sdist/aastore-$(cat VERSION)"
+          cd "$RUNNER_TEMP"
+          python "$source_dir/tests/python_test.py"
+          python "$source_dir/examples/python/basic.py"
+          python "$source_dir/examples/python/buffer_layout.py"

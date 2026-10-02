@@ -51,7 +51,11 @@ BUILD_SHARED_LIBS = "OFF"
 [tool.cibuildwheel]
 build = "cp{39,310,311,312,313}-manylinux_x86_64"
 archs = ["x86_64"]
-test-command = "python {package}/tests/python_test.py"
+test-command = [
+    "python {package}/tests/python_test.py",
+    "python {package}/examples/python/basic.py",
+    "python {package}/examples/python/buffer_layout.py",
+]
 
 [tool.cibuildwheel.linux]
 manylinux-x86_64-image = "manylinux2014"

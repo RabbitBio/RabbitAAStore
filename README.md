@@ -94,34 +94,29 @@ ctest --test-dir build-example --output-on-failure
 
 ## Python 接口
 
-在仓库根目录安装，编译依赖由 pip 的隔离构建环境准备；本机仍需 C++17 编译器
-和 Python 开发头文件。无需安装 NumPy：
+支持 Linux、Python 3.9 及以上版本。在仓库根目录安装；本机需要 C++17 编译器
+和 Python 开发头文件，其他编译依赖由 pip 的隔离构建环境准备。无需安装 NumPy：
 
 ```bash
 python -m pip install .
-python tests/python_test.py
+python examples/python/basic.py
+python examples/python/buffer_layout.py
 ```
 
-Python 包默认使用 pread，避免 wheel 依赖系统 liburing。需要在本机启用 io_uring 时，
-先安装 liburing 开发包，再显式配置：
+两个示例自行创建小 FASTA，在临时目录中建库并自动清理。完整的输入、选项、结果、
+数据布局、输出复用、错误和生命周期说明见 [Python API 指南](docs/python_api.md)；
+公开签名与类型见 [类型声明](python/aastore/__init__.pyi)。
+
+Python 包和 portable wheel 默认使用 pread。需要在本机启用 io_uring 时，
+先安装 liburing 开发包，再从源码显式构建：
 
 ```bash
 python -m pip install . -Ccmake.define.AASTORE_ENABLE_IO_URING=ON
 ```
 
-Python wheel 只安装 Python 扩展、模块和类型声明；C++ SDK 使用上述独立安装流程。
-本机启用 io_uring 构建的 wheel 可能依赖系统 `liburing`，运行时 Auto 回退无法解决
-动态库缺失导致的导入失败。手动触发仓库的 portable wheels 工作流可构建禁用 io_uring
-并经 auditwheel 处理的 Linux wheel；这些 wheel 使用 pread 后端。
-
-源码包也可独立重建：
-
-```bash
-python -m pip install build
-python -m build --sdist
-python -m pip wheel dist/aastore-0.1.0.tar.gz --no-deps -w dist \
-  -Ccmake.define.AASTORE_ENABLE_IO_URING=OFF
-```
+Python wheel 包含扩展、模块和类型声明，C++ SDK 使用上述独立安装流程。
+io_uring 源码构建可能依赖系统 `liburing`；重新分发时的要求和源码包重建步骤见
+[发布指南](docs/releasing.md)。
 
 Python 复用相同的 C++ 建库、编码和读取核心，不启动外部命令行程序：
 
@@ -129,73 +124,31 @@ Python 复用相同的 C++ 建库、编码和读取核心，不启动外部命�
 import aastore
 
 stats = aastore.build_fasta("input.fasta", "store", threads=4)
-options = aastore.ReadOptions(threads=4)
+reads = aastore.ReadOptions(threads=4)
 
 with aastore.Store("store") as store:
-    sequence = store.get(5)                  # str，ID 从 0 开始
-    batch = store.batch_get([1, 5, 10], options)
-    print(batch[0])                          # 按请求顺序访问，返回 str 副本
-    for sequence in batch:
-        consume(sequence)
-    view = batch.view(0)                    # 只读 memoryview，不复制序列字节
-    block = store.sequential_get(0, 100, options)  # [begin, end)，使用 pread
+    sequence = store.get(0)                  # str，ID 从 0 开始
+    batch = store.batch_get([0, 0], reads)    # 保留请求顺序和重复 ID
+    print(batch[0], list(batch))             # 字符串访问创建副本
+    view = batch.view(0)                     # 只读字节视图，保留所属批次
+    raw = batch.storage[
+        batch.offsets[0]:batch.offsets[0] + batch.lengths[0]
+    ]                                       # 与 view 指向同一条目的字节
 
     fields = aastore.RecordFields.Name | aastore.RecordFields.Sequence
-    records = store.batch_get_records([1, 5], fields, options)
+    records = store.batch_get_records([0], fields, reads)
     print(records[0]["name"], records[0]["sequence"])
 ```
 
 `Batch`、`TextBatch` 和 `RecordBatch` 支持 `len()`、负索引、迭代与切片；切片返回
-字符串或记录字典列表，逐条访问才创建 Python 对象。`batch.view(i)` 是原始字节视图，
-会保留整个批次；即使批次变量删除或 Store 关闭，视图仍有效。`batch.storage` 是完整
-只读 arena，随机批读包含逐条 NUL，顺读不包含；通常应使用 `view(i)` 而不是自行解析 arena。
-名称和描述转为 `str` 时要求有效 UTF-8，原始字节可通过文本批次的 `view(i)` 访问。
+字符串或记录字典列表。`Batch` 与 `TextBatch` 的 `storage` 为只读字节视图，
+`offsets`、`lengths` 为只读的一维本机字节序 `uint64` 视图，均保留所属批次。
+文本长度以 UTF-8 字节计；按偏移与长度取条目，不通过 NUL 猜测边界。
 
-驻留模式与前缀预算通过 `StoreOptions` 设置；统计字段只读，诊断默认关闭：
-
-```python
-store_options = aastore.StoreOptions(
-    storage_mode=aastore.StorageMode.PrefixMemory,
-    cache_bytes=1024 * 1024 * 1024,
-    threads=4,
-)
-with aastore.Store("store", store_options) as store:
-    reads = aastore.ReadOptions(threads=4, io_backend=aastore.IoBackend.IoUring)
-    batch = store.batch_get([1, 5, 10], reads)
-    print(batch.stats.read_bytes)
-```
-
-FullMemory 使用 `StorageMode.FullMemory`。建库参数也可通过 `BuildOptions` 提供，Python
-中的 `threads` 对应 C++ 的 `encode_threads`；`build_fasta()` 的显式关键字覆盖选项但不修改原对象。
-
-已有缓冲时可以直接写入；输出列表每项必须是容量足够、连续一维且可写的字节缓冲，
-空序列允许 `None`。在写入前验证数量、容量和写入区不重叠：
-
-```python
-with aastore.Store("store") as store:
-    ids = [1, 5, 10]
-    outputs = [bytearray(store.sequence_length(i)) for i in ids]
-    stats = store.batch_get_into(ids, outputs, options)
-    print(outputs[0].decode("ascii"))
-    # outputs 可以在下一批读取时复用；不会追加 NUL。
-```
-
-`sequential_get_into(begin, end, outputs, options)` 使用同样的缓冲约定。可写 `memoryview`
-切片和符合缓冲协议的字节数组也可使用，Python 不暴露裸 `char*` 或可变 `std::string`。
-建库、打开库、读取和解码释放 GIL，允许多个 Python 调用线程共享只读 Store，但不可在
-原生写入期间修改或读取同一输出区；缓冲协议阻止的是扩容，不是对字节内容的并发访问。
-在途调用保留自己的库资源引用；`close()` 后拒绝新的读取，现有 Batch 不受影响。
-
-普通 C++ 构建默认不需要 Python 或 pybind11。手动构建绑定时可使用：
-
-```bash
-python -m pip install 'pybind11>=3.0,<4'
-cmake -S . -B build-python -DAASTORE_BUILD_PYTHON=ON \
-  -DPython_EXECUTABLE="$(python -c 'import sys; print(sys.executable)')" \
-  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
-cmake --build build-python -j 8
-ctest --test-dir build-python --output-on-failure
-```
+`BuildOptions`、`StoreOptions`、`ReadOptions` 分别控制建库、驻留模式和每次读取，
+统计字段只读。已有输出区时，可用 `batch_get_into()` 或 `sequential_get_into()`
+直接写入并复用 `bytearray`；原生工作释放 GIL，输出缓冲不可同时被其他线程读写。
+Store 关闭后已有结果与视图仍有效，关闭后的新读取会被拒绝。
 
 ## 建库
 

@@ -62,6 +62,42 @@ class PythonInterfaceTest(unittest.TestCase):
                           "io_submit_calls", "io_submit_ns", "io_wait_calls", "io_empty_waits"):
                 self.assertEqual(getattr(stats, field), 0, field)
 
+    # 用布局视图直接切分 arena，长度按原始字节计算，不依赖字符串索引接口。
+    def check_layout(self, batch, values, terminated=False):
+        offsets, lengths = batch.offsets, batch.lengths
+        encoded = [value.encode("utf-8") for value in values]
+        for view in (offsets, lengths):
+            self.assertIsInstance(view, memoryview)
+            self.assertEqual(view.ndim, 1)
+            self.assertEqual(view.itemsize, 8)
+            self.assertIn(view.format, ("Q", "L", "@Q", "@L"))
+            self.assertEqual(view.shape, (len(values),))
+            self.assertEqual(view.strides, (8,))
+            self.assertEqual(view.nbytes, 8 * len(values))
+            self.assertTrue(view.readonly)
+            self.assertTrue(view.c_contiguous)
+            sliced = view[::2]
+            self.assertEqual(sliced.tolist(), view.tolist()[::2])
+            self.assertTrue(sliced.readonly)
+            with self.assertRaises(TypeError):
+                view[:] = view
+            with self.assertRaises(TypeError):
+                sliced[:] = sliced
+        self.assertEqual(lengths.tolist(), list(map(len, encoded)))
+        storage = batch.storage
+        self.assertEqual(
+            [bytes(storage[offset:offset + length])
+             for offset, length in zip(offsets, lengths)], encoded,
+        )
+        self.assertEqual(storage.nbytes, sum(map(len, encoded)) +
+                         (len(values) if terminated else 0))
+        if terminated:
+            for offset, length in zip(offsets, lengths):
+                self.assertEqual(storage[offset + length], 0)
+        for field in ("offsets", "lengths"):
+            with self.assertRaises(AttributeError):
+                setattr(batch, field, [])
+
     # 核对建库统计、选项覆盖、文本列开关及覆盖已有库的行为。
     def test_build_and_options(self):
         self.assertEqual(self.build_stats.sequences, len(self.sequences))
@@ -192,6 +228,93 @@ class PythonInterfaceTest(unittest.TestCase):
                 names.sequence(0)
             self.assertEqual(list(store.batch_get_records([1], aastore.RecordFields.None_)), [{}])
 
+    # 覆盖乱序及重复请求、空序列和空文本；UTF-8 边界以字节而非字符计量。
+    def test_layout_views(self):
+        fasta = self.root / "layout.fasta"
+        path = self.root / "layout-store"
+        sequences = ["", "ACDEFG", "A", ""]
+        names = ["empty", "na\u00efve", "tail", "empty2"]
+        descriptions = ["", "\u63cf\u8ff0 \u00b5", "", "\u5c3e\u58f0"]
+        fasta.write_text("".join(
+            ">{}{}\n{}\n".format(name, " " + description if description else "", sequence)
+            for name, description, sequence in zip(names, descriptions, sequences)
+        ), encoding="utf-8")
+        stats = aastore.build_fasta(fasta, path)
+        ids = [2, 1, 0, 1, 3]
+        options = aastore.ReadOptions(threads=2, io_backend=aastore.IoBackend.Pread)
+        for mode in (aastore.StorageMode.ByteRange, aastore.StorageMode.PrefixMemory,
+                     aastore.StorageMode.FullMemory):
+            with self.subTest(mode=mode), aastore.Store(path, aastore.StoreOptions(
+                    storage_mode=mode, cache_bytes=max(1, stats.packed_bytes // 2))) as store:
+                self.check_layout(store.batch_get(ids, options),
+                                  [sequences[i] for i in ids], terminated=True)
+                self.check_layout(store.sequential_get(0, len(sequences), options), sequences)
+                self.check_layout(store.batch_get([], options), [], terminated=True)
+                self.check_layout(store.sequential_get(2, 2, options), [])
+                records = store.batch_get_records(ids, options=options)
+                self.check_layout(records.sequences, [sequences[i] for i in ids], terminated=True)
+                self.check_layout(records.names, [names[i] for i in ids])
+                self.check_layout(records.descriptions, [descriptions[i] for i in ids])
+                self.assertGreater(records.names.lengths[1], len(names[1]))
+                self.assertGreater(records.descriptions.lengths[1], len(descriptions[1]))
+                self.assertEqual(records.descriptions.lengths[2], 0)
+                empty = store.batch_get_records([], options=options)
+                for column in (empty.names, empty.descriptions, empty.sequences):
+                    self.check_layout(column, [])
+                with self.assertRaises(AttributeError):
+                    records.names.stats.requested_bytes = 0
+
+    # 每条序列占 50 packed 字节，按已知文件区间检验 Scan 与零/非零合并预算。
+    def test_read_strategy_and_budgets(self):
+        fasta = self.root / "range-budget.fasta"
+        path = self.root / "range-budget-store"
+        alphabet = "ACDEFGHIKLMNPQRSTVWY"
+        sequences = [(alphabet[i:] + alphabet[:i]) * 4 for i in range(8)]
+        fasta.write_text("".join(
+            ">sequence{}\n{}\n".format(i, value) for i, value in enumerate(sequences)
+        ), encoding="ascii")
+        aastore.build_fasta(fasta, path, write_names=False, write_descriptions=False)
+        sparse_ids, adjacent_ids = [0, 0, 2, 4, 6], [0, 0, 1, 2, 3]
+        # 预算只限制合并结果，零取消限额；单条读取本身仍必须完整执行。
+        cases = [
+            ("sparse-gap-limited", sparse_ids, aastore.ReadStrategy.Sparse,
+             50, 100, 0, 0, 256, (4, 200, 50, 4, 0, 0)),
+            ("sparse-gap-unlimited", sparse_ids, aastore.ReadStrategy.Sparse,
+             50, 0, 0, 0, 0, (1, 350, 350, 1, 0, 3)),
+            ("scan-limited", sparse_ids, aastore.ReadStrategy.Scan,
+             0, 75, 50, 150, 256, (2, 300, 150, 0, 2, 2)),
+            ("scan-unlimited", sparse_ids, aastore.ReadStrategy.Scan,
+             0, 0, 0, 0, 0, (1, 350, 350, 0, 1, 3)),
+            ("exact-limited", adjacent_ids, aastore.ReadStrategy.Sparse,
+             0, 1, 75, 0, 256, (4, 200, 50, 4, 0, 0)),
+            ("exact-unlimited", adjacent_ids, aastore.ReadStrategy.Sparse,
+             0, 1, 0, 0, 0, (1, 200, 200, 1, 0, 0)),
+        ]
+        with aastore.Store(path) as store:
+            for label, ids, strategy, gap, merged, exact, scan, buffer_bytes, expected in cases:
+                for backend in self.backends:
+                    with self.subTest(case=label, backend=backend):
+                        # input_sorted 是调用方承诺，当前实现不会验证非法顺序。
+                        options = aastore.ReadOptions(
+                            threads=2, io_backend=backend, input_sorted=True,
+                            read_strategy=strategy, merge_gap_bytes=gap,
+                            max_merged_range_bytes=merged, max_exact_merged_range_bytes=exact,
+                            scan_max_range_bytes=scan, io_buffer_bytes=buffer_bytes,
+                        )
+                        batch = store.batch_get(ids, options)
+                        self.assertEqual(list(batch), [sequences[i] for i in ids])
+                        stats = batch.stats
+                        self.assertEqual(stats.requested_sequences, 5)
+                        self.assertEqual(stats.requested_residues, 400)
+                        self.assertEqual(stats.unique_packed_bytes, 200)
+                        fields = ("ranges", "read_bytes", "max_range_bytes", "sparse_ranges",
+                                  "scan_ranges", "merged_gaps")
+                        self.assertEqual(tuple(getattr(stats, field) for field in fields), expected)
+                        self.assertEqual(stats.overread_bytes, stats.read_bytes - 200)
+                        self.check_stats(stats, False)
+                        with self.assertRaises(AttributeError):
+                            stats.read_bytes = 0
+
     # 保留临时批次或记录子批次的视图，确认父对象销毁后数据仍有效且不可写。
     def test_view_lifetime(self):
         store = aastore.Store(self.path)
@@ -201,6 +324,17 @@ class PythonInterfaceTest(unittest.TestCase):
         records = store.batch_get_records([1])
         child = records.descriptions
         text_view = child.view(0)
+        offsets = store.batch_get([1, 0, 1]).offsets[::2]
+        batch = store.batch_get([1, 0, 1])
+        lengths = batch.lengths[::-1]
+        expected_offsets = offsets.tolist()
+        sequential_lengths = store.sequential_get(0, 2).lengths
+        layout_records = store.batch_get_records([1])
+        record_offsets = layout_records.descriptions.offsets
+        record_lengths = store.batch_get_records([1]).descriptions.lengths
+        name_lengths = store.batch_get_records([1]).names.lengths
+        sequence_lengths = store.batch_get_records([1]).sequences.lengths
+        del batch, layout_records
         del records, child
         store.close()
         del store
@@ -209,6 +343,18 @@ class PythonInterfaceTest(unittest.TestCase):
         self.assertEqual(bytes(whole), self.sequences[1].encode() + b"\0")
         self.assertEqual(bytes(text_view), self.descriptions[1].encode("utf-8"))
         self.assertEqual(list(iterator), [self.sequences[1], self.sequences[3]])
+        self.assertEqual(offsets.tolist(), expected_offsets)
+        self.assertEqual(lengths.tolist(), [6, 0, 6])
+        self.assertEqual(sequential_lengths.tolist(), [0, 6])
+        self.assertEqual(record_offsets.tolist(), [0])
+        self.assertEqual(record_lengths.tolist(), [len(self.descriptions[1].encode("utf-8"))])
+        self.assertEqual(name_lengths.tolist(), [len(self.names[1].encode("utf-8"))])
+        self.assertEqual(sequence_lengths.tolist(), [6])
+        for layout in (offsets, lengths, sequential_lengths, record_offsets, record_lengths,
+                       name_lengths, sequence_lengths):
+            self.assertTrue(layout.readonly)
+            with self.assertRaises(TypeError):
+                layout[0] = 0
         with self.assertRaises(TypeError):
             view[0] = 0
 

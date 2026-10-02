@@ -56,6 +56,34 @@ py::buffer_info batch_buffer(T& batch) {
         1, "B", 1, {python_size(batch.storage.size())}, {1}, true);
 }
 
+// 布局数组不复制；缓冲导出对象持有原批次，确保 memoryview 的地址持续有效。
+struct BatchLayoutBuffer {
+    py::object owner;
+    const uint64_t* data;
+    py::ssize_t count;
+};
+
+// 使用私有缓冲导出器为 offsets/lengths 保活，避免返回借用裸地址的 memoryview。
+void bind_layout_buffer(py::module_& module) {
+    py::class_<BatchLayoutBuffer>(module, "_BatchLayoutBuffer", py::buffer_protocol())
+        .def_buffer([](BatchLayoutBuffer& buffer) {
+            static const uint64_t empty = 0;
+            return py::buffer_info(
+                const_cast<uint64_t*>(buffer.count == 0 ? &empty : buffer.data),
+                sizeof(uint64_t), "Q", 1, {buffer.count}, {sizeof(uint64_t)}, true);
+        });
+}
+
+// 布局值以本机 uint64 表示字节偏移或字节长度，与 storage 使用相同所有者。
+template <typename T>
+py::memoryview batch_layout(py::object owner, bool offsets) {
+    const auto& batch = owner.cast<const T&>();
+    const auto& values = offsets ? batch.offsets : batch.lengths;
+    const py::ssize_t count = python_size(values.size());
+    return py::memoryview(py::cast(BatchLayoutBuffer{
+        std::move(owner), values.data(), count}));
+}
+
 // 按批次索引复制一条字符串，避免将整个 arena 自动转换为字符串列表。
 template <typename T>
 py::str batch_item(const T& batch, py::ssize_t index) {
@@ -93,7 +121,8 @@ py::list batch_slice(const T& batch, const py::slice& slice) {
 // 为序列和文本批次提供统一的索引、切片、统计和只读缓冲接口。
 template <typename T>
 void bind_batch(py::module_& module, const char* name) {
-    py::class_<T>(module, name, py::buffer_protocol())
+    py::class_<T>(module, name, py::buffer_protocol(),
+                 "Read-only byte batch with lazy string access and owner-preserving views.")
         .def("__len__", [](const T& batch) { return python_size(batch.size()); })
         .def("size", &T::size)
         .def("empty", &T::empty)
@@ -104,8 +133,15 @@ void bind_batch(py::module_& module, const char* name) {
              "Return a read-only byte memoryview that keeps this batch alive.")
         .def_property_readonly("storage", [](py::object owner) {
             return py::memoryview(owner);
-        })
-        .def_property_readonly("stats", [](const T& batch) { return batch.stats; })
+        }, "Read-only byte arena; use offsets and lengths to locate each item.")
+        .def_property_readonly("offsets", [](py::object owner) {
+            return batch_layout<T>(std::move(owner), true);
+        }, "Read-only native uint64 byte offsets; the view keeps this batch alive.")
+        .def_property_readonly("lengths", [](py::object owner) {
+            return batch_layout<T>(std::move(owner), false);
+        }, "Read-only native uint64 byte lengths, excluding terminators; keeps the batch alive.")
+        .def_property_readonly("stats", [](const T& batch) { return batch.stats; },
+                               "Read-only snapshot of this batch's read statistics.")
         .def_buffer(&batch_buffer<T>);
 }
 
@@ -264,7 +300,7 @@ void bind_options(py::module_& module) {
         .def("__or__", [](RecordFields left, RecordFields right) { return left | right; }, py::is_operator())
         .def("__and__", [](RecordFields left, RecordFields right) { return left & right; }, py::is_operator());
 
-    py::class_<BuildOptions>(module, "BuildOptions")
+    py::class_<BuildOptions>(module, "BuildOptions", "FASTA build settings; keyword arguments only.")
         .def(py::init([](size_t threads, bool overwrite, bool names, bool descriptions) {
             return BuildOptions{overwrite, names, descriptions, threads};
         }), py::kw_only(), py::arg("threads") = 1, py::arg("overwrite") = false,
@@ -273,7 +309,7 @@ void bind_options(py::module_& module) {
         .def_readwrite("overwrite", &BuildOptions::overwrite)
         .def_readwrite("write_names", &BuildOptions::write_names)
         .def_readwrite("write_descriptions", &BuildOptions::write_descriptions);
-    py::class_<StoreOptions>(module, "StoreOptions")
+    py::class_<StoreOptions>(module, "StoreOptions", "Storage mode, preload budget and optional text residency.")
         .def(py::init([](StorageMode mode, uint64_t cache, size_t threads, bool names, bool descriptions) {
             return StoreOptions{mode, cache, threads, names, descriptions};
         }), py::kw_only(), py::arg("storage_mode") = StorageMode::ByteRange,
@@ -284,7 +320,7 @@ void bind_options(py::module_& module) {
         .def_readwrite("threads", &StoreOptions::threads)
         .def_readwrite("resident_names", &StoreOptions::resident_names)
         .def_readwrite("resident_descriptions", &StoreOptions::resident_descriptions);
-    py::class_<ReadOptions>(module, "ReadOptions")
+    py::class_<ReadOptions>(module, "ReadOptions", "Read scheduling, I/O backend and optional diagnostic settings.")
         .def(py::init([](size_t threads, IoBackend backend, size_t depth, uint64_t buffer,
                          bool sorted, ReadStrategy strategy, uint64_t gap, uint64_t merged,
                          uint64_t exact, uint64_t scan, bool diagnostics) {
@@ -309,13 +345,13 @@ void bind_options(py::module_& module) {
 
 // 导出只读统计字段，避免 Python 修改批次中的计数。
 void bind_stats(py::module_& module) {
-    py::class_<BuildStats>(module, "BuildStats")
+    py::class_<BuildStats>(module, "BuildStats", "Read-only counts and byte sizes of a completed build.")
         .def_readonly("sequences", &BuildStats::sequences)
         .def_readonly("residues", &BuildStats::residues)
         .def_readonly("packed_bytes", &BuildStats::packed_bytes)
         .def_readonly("name_bytes", &BuildStats::name_bytes)
         .def_readonly("description_bytes", &BuildStats::description_bytes);
-    py::class_<BatchStats>(module, "BatchStats")
+    py::class_<BatchStats>(module, "BatchStats", "Read-only sequence read statistics; detailed timings require diagnostics.")
 #define BATCH_STAT(field) .def_readonly(#field, &BatchStats::field)
         BATCH_STAT(full_memory) BATCH_STAT(prefix_memory) BATCH_STAT(io_uring)
         BATCH_STAT(requested_sequences) BATCH_STAT(requested_residues)
@@ -332,7 +368,7 @@ void bind_stats(py::module_& module) {
         BATCH_STAT(read_ns) BATCH_STAT(decode_ns) BATCH_STAT(cache_decode_ns)
         BATCH_STAT(diagnostics_collected);
 #undef BATCH_STAT
-    py::class_<TextBatchStats>(module, "TextBatchStats")
+    py::class_<TextBatchStats>(module, "TextBatchStats", "Read-only statistics for a name or description batch.")
 #define TEXT_STAT(field) .def_readonly(#field, &TextBatchStats::field)
         TEXT_STAT(resident) TEXT_STAT(io_uring) TEXT_STAT(requested_strings)
         TEXT_STAT(requested_bytes) TEXT_STAT(unique_bytes) TEXT_STAT(ranges)
@@ -343,7 +379,7 @@ void bind_stats(py::module_& module) {
 
 // 绑定记录的按字段访问，子批次的引用策略确保父批次存活。
 void bind_records(py::module_& module) {
-    py::class_<RecordBatch>(module, "RecordBatch")
+    py::class_<RecordBatch>(module, "RecordBatch", "Selected record fields with lazy dictionaries and byte-batch access.")
         .def("__len__", [](const RecordBatch& batch) { return python_size(batch.size()); })
         .def("size", &RecordBatch::size).def("empty", &RecordBatch::empty)
         .def_property_readonly("fields", &RecordBatch::fields)
@@ -372,12 +408,14 @@ void bind_records(py::module_& module) {
 
 // 打开库或执行读取时释放 GIL，选项按值复制，避免其他 Python 线程修改在途配置。
 void bind_store(py::module_& module) {
-    py::class_<PythonStore>(module, "Store")
+    py::class_<PythonStore>(module, "Store", "Read a FASTA store; supports with-statements and concurrent read-only calls.")
         .def(py::init([](const std::filesystem::path& path, StoreOptions options) {
             py::gil_scoped_release release;
             return PythonStore(std::make_shared<Store>(path, options));
-        }), py::arg("path"), py::arg("options") = StoreOptions{})
-        .def("close", &PythonStore::close)
+        }), py::arg("path"), py::arg("options") = StoreOptions{},
+             "Open an existing store using the specified storage and preload settings.")
+        .def("close", &PythonStore::close,
+             "Reject new reads; active reads finish and existing batches remain valid.")
         .def_property_readonly("closed", &PythonStore::closed)
         .def("__enter__", [](PythonStore& self) -> PythonStore& {
             self.acquire();
@@ -400,7 +438,7 @@ void bind_store(py::module_& module) {
             const auto store = self.acquire();
             py::gil_scoped_release release;
             return store->get(id);
-        }, py::arg("id"))
+        }, py::arg("id"), "Read a zero-based sequence ID as an independent string.")
         .def("__getitem__", [](const PythonStore& self, py::ssize_t index) {
             const auto store = self.acquire();
             const size_t id = checked_index(index, store->size());
@@ -411,22 +449,26 @@ void bind_store(py::module_& module) {
             const auto store = self.acquire();
             py::gil_scoped_release release;
             return store->batch_get(ids, options);
-        }, py::arg("ids"), py::arg("options") = ReadOptions{})
+        }, py::arg("ids"), py::arg("options") = ReadOptions{},
+             "Read nonnegative sequence IDs in request order, preserving duplicates; returns Batch.")
         .def("batch_get_into", &batch_into, py::arg("ids"), py::arg("outputs"), py::arg("options") = ReadOptions{},
              "Decode into nonoverlapping writable byte buffers without adding NUL bytes.")
         .def("sequential_get", [](const PythonStore& self, SequenceId begin, SequenceId end, ReadOptions options) {
             const auto store = self.acquire();
             py::gil_scoped_release release;
             return store->sequential_get(begin, end, options);
-        }, py::arg("begin"), py::arg("end"), py::arg("options") = ReadOptions{})
+        }, py::arg("begin"), py::arg("end"), py::arg("options") = ReadOptions{},
+             "Read the half-open ID interval [begin, end) into a Batch using pread.")
         .def("sequential_get_into", &sequential_into, py::arg("begin"), py::arg("end"),
-             py::arg("outputs"), py::arg("options") = ReadOptions{})
+             py::arg("outputs"), py::arg("options") = ReadOptions{},
+             "Read [begin, end) into reusable writable byte buffers using pread; returns BatchStats.")
         .def("batch_get_records", [](const PythonStore& self, const std::vector<SequenceId>& ids,
                                      RecordFields fields, ReadOptions options) {
             const auto store = self.acquire();
             py::gil_scoped_release release;
             return store->batch_get_records(ids, fields, options);
-        }, py::arg("ids"), py::arg("fields") = RecordFields::All, py::arg("options") = ReadOptions{});
+        }, py::arg("ids"), py::arg("fields") = RecordFields::All, py::arg("options") = ReadOptions{},
+             "Read selected sequence/name/description columns in request order; returns RecordBatch.");
 }
 
 }  // namespace
@@ -437,6 +479,7 @@ PYBIND11_MODULE(_aastore, module) {
     module.attr("__version__") = AASTORE_PYTHON_VERSION;
     bind_options(module);
     bind_stats(module);
+    bind_layout_buffer(module);
     bind_batch<Batch>(module, "Batch");
     bind_batch<TextBatch>(module, "TextBatch");
     bind_records(module);
