@@ -31,7 +31,7 @@ def main():
 
         with aastore.Store(path) as store:
             ids = [2, 0, 1, 2]
-            batch = store.batch_get(ids, reads)
+            batch = store.get(ids, reads)
             storage, offsets, lengths = batch.storage, batch.offsets, batch.lengths
             print("布局只读：", storage.readonly, offsets.readonly, lengths.readonly)
             print("偏移：", list(offsets), "字节长度：", list(lengths))
@@ -55,7 +55,7 @@ def main():
             capacity = max(map(len, sequences))
             outputs = [bytearray(capacity) for _ in ids]
             for requested in (ids, [0, 2, 1, 3]):
-                stats = store.batch_get_into(requested, outputs, reads)
+                stats = store.get_into(requested, outputs, reads)
                 values = [bytes(output[:store.sequence_length(i)]).decode("ascii")
                           for i, output in zip(requested, outputs)]
                 print("复用输出：", values, "请求数：", stats.requested_sequences)

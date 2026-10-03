@@ -11,14 +11,23 @@
 
 namespace aastore {
 
+// io_uring 后端的请求与诊断统计；区分 SQE/CQE 数量和 submit/wait API 调用次数。
 struct IoUringStats {
+    // 已成功提交的读取 SQE 数，包括短读续传。
     uint64_t submissions = 0;
+    // 正常处理的读取 CQE 数，包括尚未读完整范围的短读完成事件。
     uint64_t completions = 0;
+    // 各工作线程等待完成事件的 API 耗时之和，单位纳秒；仅诊断开启时累计。
     uint64_t wait_ns = 0;
+    // 单 ring 的未回收请求数峰值；多 ring 汇总时相加，不是同一时刻的全局峰值。
     uint64_t max_outstanding = 0;
+    // submit API 调用次数，包含重试；仅诊断开启时累计。
     uint64_t submit_calls = 0;
+    // submit API 累计耗时，单位纳秒；仅诊断开启时累计。
     uint64_t submit_ns = 0;
+    // 等待 CQE 的 API 调用次数，包含重试；仅诊断开启时累计。
     uint64_t wait_calls = 0;
+    // 调用等待 API 前完成队列为空的次数；仅诊断开启时累计。
     uint64_t empty_waits = 0;
 };
 

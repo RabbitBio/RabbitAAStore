@@ -23,6 +23,7 @@ public:
     }
 
 private:
+    // 借用调用方的线程容器，不拥有它；容器和线程借用的数据须晚于 guard 销毁。
     std::vector<std::thread>& threads_;
 };
 

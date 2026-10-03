@@ -243,7 +243,13 @@ BatchStats batch_into(const PythonStore& self, const std::vector<SequenceId>& id
     options.validate();
     WritableOutputs prepared(request_lengths(*store, ids), outputs);
     py::gil_scoped_release release;
-    return store->batch_get_into(ids, prepared.pointers, options);
+    return store->get_into(ids, prepared.pointers, options);
+}
+
+// Python 字符串不可原地修改，单条直接输出使用调用方提供的可写字节缓冲。
+BatchStats single_into(const PythonStore& self, SequenceId id,
+                       py::object output, ReadOptions options) {
+    return batch_into(self, {id}, py::make_tuple(std::move(output)), options);
 }
 
 // 将连续区间读取到 Python 输出区，保持与 C++ 接口相同的 pread 路径。
@@ -293,8 +299,6 @@ void bind_options(py::module_& module) {
     py::enum_<IoBackend>(module, "IoBackend")
         .value("Auto", IoBackend::Auto).value("Pread", IoBackend::Pread)
         .value("IoUring", IoBackend::IoUring);
-    py::enum_<ReadStrategy>(module, "ReadStrategy")
-        .value("Sparse", ReadStrategy::Sparse).value("Scan", ReadStrategy::Scan);
     py::enum_<RecordFields>(module, "RecordFields", py::arithmetic())
         .value("None_", RecordFields::None).value("Name", RecordFields::Name)
         .value("Description", RecordFields::Description).value("Sequence", RecordFields::Sequence)
@@ -328,25 +332,24 @@ void bind_options(py::module_& module) {
         .def_readwrite("resident_descriptions", &StoreOptions::resident_descriptions);
     py::class_<ReadOptions>(module, "ReadOptions", "Read scheduling, I/O backend and optional diagnostic settings.")
         .def(py::init([](size_t threads, IoBackend backend, size_t depth, uint64_t buffer,
-                         bool sorted, ReadStrategy strategy, uint64_t gap, uint64_t merged,
-                         uint64_t exact, uint64_t scan, bool diagnostics) {
-            return ReadOptions{threads, backend, depth, buffer, sorted, strategy,
-                               gap, merged, exact, scan, diagnostics};
+                         bool sorted, uint64_t gap, uint64_t merged,
+                         uint64_t exact, bool diagnostics) {
+            return ReadOptions{threads, backend, depth, buffer, sorted,
+                               gap, merged, exact, diagnostics};
         }), py::kw_only(), py::arg("threads") = 8, py::arg("io_backend") = IoBackend::Auto,
             py::arg("io_queue_depth") = 64, py::arg("io_buffer_bytes") = kIoBufferBytes,
-            py::arg("input_sorted") = false, py::arg("read_strategy") = ReadStrategy::Sparse,
+            py::arg("input_sorted") = false,
             py::arg("merge_gap_bytes") = kByteRangeMergeGapBytes,
             py::arg("max_merged_range_bytes") = kMaxMergedRangeBytes,
             py::arg("max_exact_merged_range_bytes") = kMaxExactMergedRangeBytes,
-            py::arg("scan_max_range_bytes") = kScanMaxRangeBytes,
             py::arg("collect_diagnostics") = false)
         .def("validate", &ReadOptions::validate,
-             "Validate backend and strategy; documented zero-valued budgets remain valid.")
+             "Validate backend; documented zero-valued budgets remain valid.")
 #define READ_OPTION(field) .def_readwrite(#field, &ReadOptions::field)
         READ_OPTION(threads) READ_OPTION(io_backend) READ_OPTION(io_queue_depth)
-        READ_OPTION(io_buffer_bytes) READ_OPTION(input_sorted) READ_OPTION(read_strategy)
+        READ_OPTION(io_buffer_bytes) READ_OPTION(input_sorted)
         READ_OPTION(merge_gap_bytes) READ_OPTION(max_merged_range_bytes)
-        READ_OPTION(max_exact_merged_range_bytes) READ_OPTION(scan_max_range_bytes)
+        READ_OPTION(max_exact_merged_range_bytes)
         READ_OPTION(collect_diagnostics);
 #undef READ_OPTION
 }
@@ -365,8 +368,8 @@ void bind_stats(py::module_& module) {
         BATCH_STAT(requested_sequences) BATCH_STAT(requested_residues)
         BATCH_STAT(cache_hits) BATCH_STAT(cache_misses)
         BATCH_STAT(cache_hit_residues) BATCH_STAT(cache_miss_residues)
-        BATCH_STAT(unique_packed_bytes) BATCH_STAT(ranges) BATCH_STAT(sparse_ranges)
-        BATCH_STAT(scan_ranges) BATCH_STAT(merged_gaps) BATCH_STAT(free_merges)
+        BATCH_STAT(unique_packed_bytes) BATCH_STAT(ranges)
+        BATCH_STAT(merged_gaps) BATCH_STAT(free_merges)
         BATCH_STAT(read_bytes) BATCH_STAT(overread_bytes) BATCH_STAT(max_range_bytes)
         BATCH_STAT(workers) BATCH_STAT(io_workers) BATCH_STAT(decode_workers)
         BATCH_STAT(io_queue_depth) BATCH_STAT(io_submissions) BATCH_STAT(io_completions)
@@ -442,24 +445,29 @@ void bind_store(py::module_& module) {
         .def_property_readonly("has_descriptions", [](const PythonStore& self) { return self.acquire()->has_descriptions(); })
         .def_property_readonly("decode_kernel_name", [](const PythonStore& self) { return self.acquire()->decode_kernel_name(); })
         .def("sequence_length", [](const PythonStore& self, SequenceId id) { return self.acquire()->sequence_length(id); }, py::arg("id"))
-        .def("get", [](const PythonStore& self, SequenceId id) {
+        .def("get", [](const PythonStore& self, SequenceId id, ReadOptions options) {
             const auto store = self.acquire();
             py::gil_scoped_release release;
-            return store->get(id);
-        }, py::arg("id"), "Read a zero-based sequence ID as an independent string.")
+            return store->get(id, options);
+        }, py::arg("id"), py::arg("options") = ReadOptions{},
+             "Read one nonnegative sequence ID into a one-element Batch.")
         .def("__getitem__", [](const PythonStore& self, py::ssize_t index) {
             const auto store = self.acquire();
             const size_t id = checked_index(index, store->size());
             py::gil_scoped_release release;
-            return store->get(id);
+            std::string output;
+            store->get_into(id, output);
+            return output;
         })
-        .def("batch_get", [](const PythonStore& self, const std::vector<SequenceId>& ids, ReadOptions options) {
+        .def("get", [](const PythonStore& self, const std::vector<SequenceId>& ids, ReadOptions options) {
             const auto store = self.acquire();
             py::gil_scoped_release release;
-            return store->batch_get(ids, options);
+            return store->get(ids, options);
         }, py::arg("ids"), py::arg("options") = ReadOptions{},
              "Read nonnegative sequence IDs in request order, preserving duplicates; returns Batch.")
-        .def("batch_get_into", &batch_into, py::arg("ids"), py::arg("outputs"), py::arg("options") = ReadOptions{},
+        .def("get_into", &single_into, py::arg("id"), py::arg("output"), py::arg("options") = ReadOptions{},
+             "Decode one sequence into a writable byte buffer without resizing or adding a NUL byte.")
+        .def("get_into", &batch_into, py::arg("ids"), py::arg("outputs"), py::arg("options") = ReadOptions{},
              "Decode into nonoverlapping writable byte buffers without adding NUL bytes.")
         .def("sequential_get", [](const PythonStore& self, SequenceId begin, SequenceId end, ReadOptions options) {
             const auto store = self.acquire();

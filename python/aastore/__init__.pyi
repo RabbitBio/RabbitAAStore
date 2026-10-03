@@ -30,11 +30,6 @@ class IoBackend(_PybindEnum):
     Pread: ClassVar[IoBackend]
     IoUring: ClassVar[IoBackend]
 
-class ReadStrategy(_PybindEnum):
-    __members__: ClassVar[Dict[str, ReadStrategy]]
-    Sparse: ClassVar[ReadStrategy]
-    Scan: ClassVar[ReadStrategy]
-
 class RecordFields(_PybindEnum):
     __members__: ClassVar[Dict[str, RecordFields]]
     None_: ClassVar[RecordFields]
@@ -71,17 +66,15 @@ class ReadOptions:
     io_queue_depth: int
     io_buffer_bytes: int
     input_sorted: bool
-    read_strategy: ReadStrategy
     merge_gap_bytes: int
     max_merged_range_bytes: int
     max_exact_merged_range_bytes: int
-    scan_max_range_bytes: int
     collect_diagnostics: bool
     def __init__(self, *, threads: int = 8, io_backend: IoBackend = IoBackend.Auto,
                  io_queue_depth: int = 64, io_buffer_bytes: int = 16777216,
-                 input_sorted: bool = False, read_strategy: ReadStrategy = ReadStrategy.Sparse,
+                 input_sorted: bool = False,
                  merge_gap_bytes: int = 4096, max_merged_range_bytes: int = 16384,
-                 max_exact_merged_range_bytes: int = 1048576, scan_max_range_bytes: int = 262144,
+                 max_exact_merged_range_bytes: int = 1048576,
                  collect_diagnostics: bool = False) -> None: ...
     def validate(self) -> None: ...
 
@@ -125,10 +118,6 @@ class BatchStats:
     def unique_packed_bytes(self) -> int: ...
     @property
     def ranges(self) -> int: ...
-    @property
-    def sparse_ranges(self) -> int: ...
-    @property
-    def scan_ranges(self) -> int: ...
     @property
     def merged_gaps(self) -> int: ...
     @property
@@ -311,10 +300,16 @@ class Store:
     @property
     def decode_kernel_name(self) -> str: ...
     def sequence_length(self, id: int) -> int: ...
-    def get(self, id: int) -> str: ...
-    def batch_get(self, ids: Iterable[int], options: ReadOptions = ...) -> Batch: ...
-    def batch_get_into(self, ids: Iterable[int], outputs: Iterable[Any],
-                       options: ReadOptions = ...) -> BatchStats: ...
+    @overload
+    def get(self, id: int, options: ReadOptions = ...) -> Batch: ...
+    @overload
+    def get(self, ids: Iterable[int], options: ReadOptions = ...) -> Batch: ...
+    @overload
+    def get_into(self, id: int, output: Any,
+                 options: ReadOptions = ...) -> BatchStats: ...
+    @overload
+    def get_into(self, ids: Iterable[int], outputs: Iterable[Any],
+                 options: ReadOptions = ...) -> BatchStats: ...
     def sequential_get(self, begin: int, end: int, options: ReadOptions = ...) -> Batch: ...
     def sequential_get_into(self, begin: int, end: int, outputs: Iterable[Any],
                             options: ReadOptions = ...) -> BatchStats: ...

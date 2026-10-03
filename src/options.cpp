@@ -37,13 +37,6 @@ void ReadOptions::validate() const {
         default:
             throw std::invalid_argument("unknown I/O backend");
     }
-    switch (read_strategy) {
-        case ReadStrategy::Sparse:
-        case ReadStrategy::Scan:
-            break;
-        default:
-            throw std::invalid_argument("unknown read strategy");
-    }
 }
 
 }  // namespace aastore

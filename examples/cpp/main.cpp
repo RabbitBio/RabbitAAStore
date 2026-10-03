@@ -39,7 +39,7 @@ int main() {
         }
         aastore::build_fasta(input, database);
         aastore::Store store(database);
-        auto batch = store.batch_get({1, 0, 1});
+        auto batch = store.get({1, 0, 1});
         if (batch.size() != 3 || batch[0] != "MKT" ||
             batch[1] != "ACDEFG" || batch[2] != "MKT") {
             throw std::runtime_error("unexpected sequence data");

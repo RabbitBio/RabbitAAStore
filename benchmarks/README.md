@@ -17,7 +17,7 @@ Record sampling changes the workload, not the underlying database.
 | I/O buffer setting | 16 MiB per batch call, shared among rings |
 | Queue depth setting | 64, subject to the library's range and buffer limits |
 
-The caller invokes `batch_get()` serially with bounded batches in both modes.
+The caller invokes `get()` serially with bounded batches in both modes.
 AAStore distributes work internally using `ReadOptions::threads`.
 FullMemory takes the resident decode path, bypassing range planning and disk reads
 during fetch. NonFull plans ranges and reads/decodes using its internal workers.
@@ -56,12 +56,17 @@ between batches. OS code pages and unrelated files are not flushed.
 ## Metrics
 
 The benchmark explicitly enables `ReadOptions::collect_diagnostics` and reports
-`collect_diagnostics=1`. The library leaves detailed read timings and submit/wait
-API counters off by default; basic byte, range, request and SQE counts remain
-available. Benchmark fetch timings include the enabled diagnostic overhead.
+`collect_diagnostics=1`. The library leaves coverage/overread, merge and prefix
+residue counts, detailed read timings and submit/wait API counters off by default;
+basic read-byte, range, request, hit/miss and SQE/CQE counts remain available.
+Disabling diagnostics also skips the parallel coverage-statistics pass.
+Benchmark fetch timings include the enabled diagnostic overhead.
 
 - `open_ms`: Store construction, including FullMemory or PrefixMemory preload.
+- `preload_ms`: the packed-data preload portion of opening a PrefixMemory or
+  FullMemory store; it is already included in `open_ms`.
 - `fetch_ms`: sum of timed AAStore calls, excluding request generation and hashes.
+- `fetch_user_ms`, `fetch_system_ms`: process CPU time spent in the fetch calls.
 - `service_ms`: `open_ms + fetch_ms`, the primary cold service comparison.
 - `end_to_end_ms`: also includes trace preparation, output consumption and harness
   overhead; excludes the cache-eviction setup and process startup.
@@ -70,7 +75,9 @@ available. Benchmark fetch timings include the enabled diagnostic overhead.
   **not** machine memory usage or kernel page-cache size.
 - `resident_bytes`: AAStore's resident packed bytes, excluding metadata.
 - `open_storage_read_bytes`, `fetch_storage_read_bytes`: Linux process-attributed
-  device reads; distinct from logical AAStore `read_bytes` and range counts.
+  device reads from `/proc/self/io` `read_bytes` deltas, including attributable
+  readahead; distinct from logical AAStore `read_bytes`, range counts, and
+  whole-device counters.
 - `trace_hash_fnv1a64`, `output_hash_fnv1a64`: order-sensitive noncryptographic
   checks, including ID, length and every output byte. These must match paired cases.
 
@@ -108,3 +115,73 @@ Use `--backend pread` for a separate matched backend experiment. Omitting
 The runner defaults to smaller request fractions for quick trials; the command
 above explicitly selects the current publication pilot. Batch-size sweeps and
 additional repeats can follow the pilot.
+
+## Individual Benchmark Runs
+
+Run these commands from the repository root after building `aastore_bench`.
+They cover random reads, a 512 MiB packed prefix, FullMemory, and the dedicated
+sequential read interface:
+
+```sh
+./build/aastore_bench /path/to/original/store \
+  --requests 1000000 --rounds 1 --threads 8 --drop-cache \
+  --io-backend uring --queue-depth 64 \
+  --io-buffer-bytes 16777216
+
+./build/aastore_bench /path/to/original/store \
+  --requests 1000000 --rounds 1 --threads 8 --drop-cache --memory-mb 512
+
+./build/aastore_bench /path/to/original/store \
+  --requests 1000000 --rounds 1 --threads 8 --drop-cache --memory-mb -1
+
+./build/aastore_bench /path/to/original/store \
+  --requests 1000000 --fast-sequential --threads 8
+```
+
+`--memory-mb 0` selects ByteRange, a positive value selects PrefixMemory, and
+`-1` selects FullMemory. `--full-memory` is an alias for `--memory-mb -1`.
+A positive budget preloads a fixed packed prefix; reads do not change the
+resident region. `--memory-bytes N` selects an exact prefix budget, with zero
+selecting ByteRange; it cannot be combined with `--memory-mb` or `--full-memory`.
+
+`--io-backend auto` defaults to trying io_uring with fallback to pread when
+unavailable. Choose `pread` for a matched backend comparison or explicit `uring`
+to fail if unavailable. `--threads` sets the internal worker budget, and
+`--queue-depth` sets the per-ring target depth (default 64).
+`--io-buffer-bytes` controls the shared range-buffer budget (default 16 MiB),
+which can reduce the actual queue depth.
+
+Range planning uses `--merge-gap` (default 4096 bytes) and `--max-range` (default
+16384 bytes); `--max-exact-range` limits merges without extra reads (default
+1048576 bytes). Compare merge settings using the same workload and seed.
+Inspect `ranges`, `read_bytes`, and `overread_bytes` to understand the planner's
+decisions. `--fast-sequential` instead calls `sequential_get()` over a prefix
+of consecutive IDs; `--requests` must fit within the store. It cannot be
+combined with `--batch-bytes`.
+
+For bounded random batches and sampling without replacement, use
+`--sample-percent P --batch-bytes N` as described in the matrix above.
+`--sample-percent` cannot be combined with `--requests`, sequential modes, or
+`--ids-file`. Fetch metrics sum all batches and rounds; preload happens once.
+`--drop-cache` requires `--rounds 1` and a fresh process per cold repeat,
+following the same file-cache eviction and validation rules described above.
+
+## Matching MMseqs2 createdb IDs
+
+To match the physical IDs produced by ordinary MMseqs2 `createdb --shuffle 1`,
+build an input-order store and apply the default 32-way shuffle:
+
+```sh
+cmake --build build --target aastore_build aastore_reorder_createdb -j 8
+./build/aastore_build proteins.fa proteins.aastore.input-order --sequences-only
+./build/aastore_reorder_createdb \
+  proteins.aastore.input-order proteins.aastore \
+  --threads 8 --remove-source
+```
+
+The tool scans the source sequentially, routes each original ID into shard
+`id % 32`, then combines the 32 shards in order. With `--remove-source`, it
+removes the source only after the output files and directories have been synced
+and committed; a failure before that point preserves the source. The output
+contains sequences only. This ordering applies to the ordinary default
+`createdb` shuffle, not GPU or length-based reordering.

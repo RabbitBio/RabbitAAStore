@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Collect packed-byte coverage, overread, merge counts and prefix hit/miss
+  residue counts only when `ReadOptions::collect_diagnostics` is enabled.
+  Text coverage, overread and merge counts follow the same switch. Disabled
+  fields remain zero and the parallel coverage-statistics pass is skipped.
+  Keep basic request, hit/miss, read-byte, range, worker and SQE/CQE counts,
+  along with the maximum range size needed for buffer budgeting.
+- Unify single and random batch sequence reads as `get(id_or_ids, options)`,
+  always returning `Batch`. Rename `batch_get_into` to `get_into` while keeping
+  caller-owned output buffers and the C++ single-string overload. Python
+  single `get_into` accepts a writable byte buffer; `store[index]` still returns
+  a string. Remove the old batch method names; sequential and record reads
+  are unchanged. Update callers and rebuild; existing databases remain valid.
+- Load resident name and description columns into Store-owned buffers instead
+  of pre-touching file mappings. Keep on-demand reads and mapped text indexes
+  unchanged; `resident_text_bytes` reports the loaded text buffers.
+- Remove the Scan strategy, `ReadStrategy`, `read_strategy`, and
+  `scan_max_range_bytes` from C++ and Python, together with the benchmark's
+  `--read-strategy` and `--scan-max-range` flags. Keep the existing Sparse
+  gap/size-based merging and sequential read APIs. Use `ranges` instead of
+  the removed `sparse_ranges` and `scan_ranges` counters; rebuild callers.
+- Consolidate API migration notes: update callers and rebuild after removing
+  dynamic sequence-cache modes and their admission/eviction statistics; choose
+  ByteRange, PrefixMemory, or FullMemory instead. Existing AAPCMP3 databases
+  do not need rebuilding for these API changes.
+- Replace read options `io_threads`, `io_uring_workers`, and `io_decode_threads`
+  with the shared `threads` budget; rename the Store option `preload_threads`
+  to `threads`. Remove `io_uring_max_bounded_workers` and its statistics;
+  AAStore does not configure or query kernel io-wq worker limits. Remove old
+  settings and remeasure CPU/I/O costs for highly concurrent workloads.
+- Remove the `sequential_get_into(..., Batch&, ...)` overload; use caller-owned
+  output buffers with the pointer-array overload and consume the returned
+  `BatchStats`.
+- Remove the benchmark's `--prefix-memory` switch; select a fixed packed prefix
+  with a positive `--memory-mb` or an exact `--memory-bytes` budget.
 - Consolidate engineering test fixtures in their runners and remove redundant
   probe cases and detailed toolchain snapshot checks while retaining legacy
   io_uring, linked dependency and installed SDK coverage.
@@ -20,8 +54,8 @@
 - Detect baseline and optional liburing APIs at configure time so older
   READV-only libraries remain usable; check static SDK probe dependencies and
   liburing structure layouts before linking a consumer.
-- Centralize option validation and reject unknown storage modes, I/O backends,
-  and read strategies before file access or output writes, including empty reads.
+- Centralize option validation and reject unknown storage modes and I/O backends
+  before file access or output writes, including empty reads.
 - Expose optional `validate()` checks for C++ and Python configuration objects
   while preserving documented zero-valued read budgets and thread settings.
 - Select Python development components compatible with CMake 3.16/3.17.
@@ -33,7 +67,7 @@
   result types accurately in Python type declarations.
 - Add a practical Python API guide and self-contained examples for records,
   batch buffer layouts, and reusable output buffers; run the examples in CI.
-- Cover Python batch layout lifetimes, UTF-8 byte boundaries, Scan reads,
+- Cover Python batch layout lifetimes, UTF-8 byte boundaries, random reads,
   sorted requests, and range budgets with installed-package tests.
 - Add an installable C++ SDK with the `aastore::aastore` CMake target,
   relocatable package configuration, package version checks, and pkg-config metadata.

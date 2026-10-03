@@ -28,6 +28,8 @@ python -m pip install .
 NumPy 是可选的使用工具，不是 AAStore 的运行依赖。
 
 Python 包默认禁用 io_uring，使用 pread；portable wheels 工作流也采用此配置。
+新部署的内核建议见 [README 构建说明](../README.md#构建)；默认的 pread 后端不要求
+内核提供 io_uring。
 需要在本机启用 io_uring 时，先安装 liburing 开发包，再从源码构建：
 
 ```bash
@@ -120,6 +122,10 @@ built = aastore.build_fasta(fasta, path, options, threads=4)
 | `resident_names` | `False` | 将名称数据预载入内存 |
 | `resident_descriptions` | `False` | 将描述数据预载入内存 |
 
+启用 `resident_names` 或 `resident_descriptions` 后，打开库时将对应列的完整正文
+读入 `Store` 持有的内存缓冲。后续批读直接从该缓冲复制，不再读取正文文件；文本索引
+仍使用只读映射。`resident_text_bytes` 返回这些正文缓冲的总字节数，不是进程实时 RSS。
+
 `PrefixMemory` 的前缀固定，不会动态淘汰或更换内容；完全命中前缀的序列从内存解码，
 其他序列仍按范围读取。`FullMemory` 在打开时预载全部 packed 序列数据。
 这两个模式驻留的是编码数据，不是预先生成的 Python 字符串。
@@ -142,18 +148,16 @@ with aastore.Store(path, opening) as store:
 | `threads` | `8` | 本次读取的用户态工作线程上限，包含调用线程 |
 | `io_backend` | `IoBackend.Auto` | 可选 `Auto`、`Pread`、`IoUring` |
 | `input_sorted` | `False` | 调用方承诺请求 ID 已非递减排列，可重复；开启后跳过内部排序 |
-| `read_strategy` | `ReadStrategy.Sparse` | 可选 `Sparse` 或 `Scan` 的范围合并策略 |
-| `merge_gap_bytes` | `4096` | Sparse 合并允许跨过的字节间隙 |
-| `max_merged_range_bytes` | `16384` | Sparse 一般合并范围上限 |
+| `merge_gap_bytes` | `4096` | 合并允许跨过的字节间隙 |
+| `max_merged_range_bytes` | `16384` | 跨非零间隙合并的范围上限 |
 | `max_exact_merged_range_bytes` | `1048576` | 无额外读取的连续范围合并上限 |
-| `scan_max_range_bytes` | `262144` | Scan 范围跨度上限 |
 | `io_queue_depth` | `64` | 每个 io_uring worker 的队列深度 |
 | `io_buffer_bytes` | `16777216` | 所有 io_uring ring 合计的在途读取缓冲预算 |
-| `collect_diagnostics` | `False` | 收集额外阶段耗时和调用计数 |
+| `collect_diagnostics` | `False` | 收集读取放大、合并次数、命中残基数、阶段耗时及调用计数 |
 
 `input_sorted=True` 是调用方的承诺，库不会验证乱序输入。只有 ID 非递减排列时才能开启，
 例如 `[0, 0, 2]` 合法，`[2, 0]` 应保持默认排序。
-`max_merged_range_bytes`、`max_exact_merged_range_bytes`、`scan_max_range_bytes` 为 `0`
+`max_merged_range_bytes`、`max_exact_merged_range_bytes` 为 `0`
 时分别取消对应的合并大小限制；`io_buffer_bytes=0` 取消由缓冲预算推导的队列深度限制，
 仍受 `io_queue_depth` 等条件约束。`merge_gap_bytes=0` 则表示不跨越额外物理间隙，
 并不取消 gap 限制。合并大小限制不会将单条超长序列拆开。
@@ -182,9 +186,10 @@ reads = aastore.ReadOptions(
 
 | 调用 | 返回值 | 顺序与用途 |
 | --- | --- | --- |
-| `store.get(id)` / `store[id]` | `str` | 单条序列副本 |
+| `store.get(id, reads)` | `Batch` | 包含一条序列，使用 `batch[0]` 或 `batch.view(0)` 访问 |
+| `store[id]` | `str` | 单条序列副本，保留整数索引的便利用法 |
 | `store.sequence_length(id)` | `int` | 序列长度，便于预分配输出 |
-| `store.batch_get(ids, reads)` | `Batch` | 按请求顺序返回，保留重复 ID |
+| `store.get(ids, reads)` | `Batch` | 按请求顺序返回，保留重复 ID |
 | `store.sequential_get(begin, end, reads)` | `Batch` | 连续半开区间 `[begin, end)` |
 | `store.batch_get_records(ids, fields, reads)` | `RecordBatch` | 按请求顺序取得所选记录字段 |
 
@@ -202,7 +207,7 @@ reads = aastore.ReadOptions(
 
 ```python
 with aastore.Store(path) as store:
-    batch = store.batch_get([2, 0, 2], reads)
+    batch = store.get([2, 0, 2], reads)
     print(batch[0], list(batch), batch[-2:])
     raw = batch.view(0)
     print(raw.readonly, bytes(raw))
@@ -256,7 +261,7 @@ assert bytes(raw) == bytes(batch.view(i))
 ```
 
 偏移单位始终是字节。文本长度也是 UTF-8 **字节数**，不是 `len(text)` 的字符数。
-`batch_get()` 以及 `batch_get_records()` 中的序列批次，在每条序列后追加一个 NUL，
+`get()` 以及 `batch_get_records()` 中的序列批次，在每条序列后追加一个 NUL，
 三种驻留模式一致；`sequential_get()` 的输出连续拼接序列，不追加 NUL。
 文本批次也不追加 NUL。应始终按 `offsets + lengths`
 定位，避免把整块 `storage` 当成一个字符串或通过 NUL 猜测记录边界。
@@ -281,15 +286,21 @@ first = storage[int(offsets[0]):int(offsets[0] + lengths[0])]
 
 Python 用可写缓冲对象承接 C++ 的直接输出接口，例如 `bytearray` 或连续的可写
 `memoryview`。C++ 的裸 `char*` 和可变 `std::string` 不直接暴露为 Python 参数。
+单条写法是 `store.get_into(id, output, reads)`，返回 `BatchStats`；Python 的 `str`
+不可修改，因此这里的 `output` 同样是预先分配的可写字节缓冲，不会自动调整大小。
 
 ```python
 with aastore.Store(path) as store:
+    output = bytearray(store.sequence_length(1))
+    store.get_into(1, output, reads)
+    print(output.decode("ascii"))
+
     ids = [2, 0, 2]
     outputs = [bytearray(store.sequence_length(i)) for i in ids]
-    stats = store.batch_get_into(ids, outputs, reads)
+    stats = store.get_into(ids, outputs, reads)
     print(outputs[0].decode("ascii"), stats.requested_sequences)
     # 下一次请求容量足够时，可重用同一组 bytearray。
-    store.batch_get_into(ids, outputs, reads)
+    store.get_into(ids, outputs, reads)
 ```
 
 `sequential_get_into(begin, end, outputs, reads)` 使用相同约定，输出数量为 `end - begin`。
@@ -320,9 +331,13 @@ with aastore.Store(path) as store:
 | `BatchStats` | `requested_sequences`、`requested_residues`、`cache_hits`、`cache_misses`、`read_bytes`、`ranges`、`io_uring` |
 | `TextBatchStats` | `requested_strings`、`requested_bytes`、`read_bytes`、`resident`、`io_uring` |
 
-`BatchStats.diagnostics_collected` 标识是否开启额外诊断；默认关闭时，阶段耗时和部分
-底层调用计数字段保持零，不能把这些零当成实测耗时。开启后可查看 `layout_ns`、
-`range_plan_ns`、`read_ns`、`decode_ns` 等纳秒字段。
+`BatchStats.diagnostics_collected` 标识是否开启额外诊断；默认关闭时，
+`cache_hit_residues`、`cache_miss_residues`、`unique_packed_bytes`、`merged_gaps`、
+`free_merges`、`overread_bytes`、阶段耗时和 submit/wait 调用诊断字段保持零。
+文本列的 `unique_bytes`、`merged_gaps`、`overread_bytes` 也由同一开关控制。
+这些零表示未采集，不能当成实测结果；关闭时跳过去重字节统计的额外扫描和线程启动。
+请求量、命中条数、读取字节数、范围/线程/队列及 SQE/CQE 计数仍然保留。
+开启后还可查看 `layout_ns`、`range_plan_ns`、`read_ns`、`decode_ns` 等纳秒字段。
 io_uring 的 `io_workers` 和 `decode_workers` 描述同一组线程，不应相加。
 
 `Store` 还提供只读的 `total_residues`、`packed_bytes`、`storage_mode`、`resident_bytes`、
@@ -356,8 +371,8 @@ io_uring 的 `io_workers` 和 `decode_workers` 描述同一组线程，不应相
 
 ```python
 with aastore.Store(path) as store:
-    view = store.batch_get([0]).view(0)
-    offsets = store.batch_get([0]).offsets
+    view = store.get([0]).view(0)
+    offsets = store.get([0]).offsets
 # 两个临时批次仍由各自视图保留，Store 已关闭。
 print(bytes(view), offsets[0])
 ```

@@ -32,7 +32,7 @@ class PythonInterfaceTest(unittest.TestCase):
         cls.uring_reason = None
         with aastore.Store(cls.path) as store:
             try:
-                store.batch_get([1], aastore.ReadOptions(io_backend=aastore.IoBackend.IoUring))
+                store.get([1], aastore.ReadOptions(io_backend=aastore.IoBackend.IoUring))
                 cls.backends.append(aastore.IoBackend.IoUring)
             except RuntimeError as error:
                 if "io_uring unavailable" not in str(error):
@@ -59,7 +59,9 @@ class PythonInterfaceTest(unittest.TestCase):
         if not diagnostics:
             for field in ("layout_ns", "sort_ns", "range_plan_ns", "worker_wall_ns",
                           "worker_max_busy_ns", "read_ns", "decode_ns", "cache_decode_ns",
-                          "io_submit_calls", "io_submit_ns", "io_wait_calls", "io_empty_waits"):
+                          "io_submit_calls", "io_submit_ns", "io_wait_calls", "io_empty_waits",
+                          "cache_hit_residues", "cache_miss_residues", "unique_packed_bytes",
+                          "merged_gaps", "free_merges", "overread_bytes"):
                 self.assertEqual(getattr(stats, field), 0, field)
 
     # 用布局视图直接切分 arena，长度按原始字节计算，不依赖字符串索引接口。
@@ -116,7 +118,7 @@ class PythonInterfaceTest(unittest.TestCase):
         with aastore.Store(path) as store:
             self.assertFalse(store.has_names)
             self.assertFalse(store.has_descriptions)
-            self.assertEqual(store.get(1), self.sequences[1])
+            self.assertEqual(store.get(1)[0], self.sequences[1])
             with self.assertRaises(RuntimeError):
                 store.batch_get_records([1])
         with self.assertRaises(RuntimeError):
@@ -164,16 +166,20 @@ class PythonInterfaceTest(unittest.TestCase):
         for mode in (aastore.StorageMode.ByteRange, aastore.StorageMode.PrefixMemory,
                      aastore.StorageMode.FullMemory):
             with self.open_store(mode) as store:
-                for field, value in (("io_backend", aastore.IoBackend(99)),
-                                     ("read_strategy", aastore.ReadStrategy(99))):
-                    options = aastore.ReadOptions(io_backend=aastore.IoBackend.Pread)
-                    setattr(options, field, value)
-                    with self.subTest(mode=mode, invalid_field=field):
+                for backend in (aastore.IoBackend(99), aastore.IoBackend(255)):
+                    options = aastore.ReadOptions(io_backend=backend)
+                    with self.subTest(mode=mode, invalid_backend=backend):
                         with self.assertRaises(ValueError):
                             options.validate()
+                        with self.assertRaises(ValueError):
+                            store.get(1, options)
+                        output = bytearray(b"######")
+                        with self.assertRaises(ValueError):
+                            store.get_into(1, output, options)
+                        self.assertEqual(output, b"######")
                         for ids in ([1], []):
                             with self.assertRaises(ValueError):
-                                store.batch_get(ids, options)
+                                store.get(ids, options)
                             for fields in (aastore.RecordFields.None_, aastore.RecordFields.Name,
                                            aastore.RecordFields.Description, aastore.RecordFields.Sequence,
                                            aastore.RecordFields.All):
@@ -181,7 +187,7 @@ class PythonInterfaceTest(unittest.TestCase):
                                     store.batch_get_records(ids, fields, options)
                             buffers = [bytearray(b"#" * len(self.sequences[i])) for i in ids]
                             with self.assertRaises(ValueError):
-                                store.batch_get_into(ids, buffers, options)
+                                store.get_into(ids, buffers, options)
                             self.assertEqual(buffers, [b"#" * len(self.sequences[i]) for i in ids])
                         for end in (1, 2):
                             with self.assertRaises(ValueError):
@@ -191,18 +197,58 @@ class PythonInterfaceTest(unittest.TestCase):
                                 store.sequential_get_into(1, end, buffers, options)
                             self.assertEqual(buffers, [b"#" * len(self.sequences[i]) for i in range(1, end)])
 
+    # 单条和批量 get 都返回 Batch；直接输出复用调用方内存而不修改尾部。
+    def test_unified_get(self):
+        for mode in (aastore.StorageMode.ByteRange, aastore.StorageMode.PrefixMemory,
+                     aastore.StorageMode.FullMemory):
+            with self.open_store(mode) as store:
+                self.assertFalse(hasattr(store, "batch_get"))
+                self.assertFalse(hasattr(store, "batch_get_into"))
+                for backend in self.backends:
+                    for diagnostics in (False, True):
+                        reads = aastore.ReadOptions(threads=8, io_backend=backend,
+                                                   collect_diagnostics=diagnostics)
+                        for id in (0, 1, 2, 3):
+                            with self.subTest(mode=mode, backend=backend, id=id,
+                                              diagnostics=diagnostics):
+                                batch = store.get(id=id, options=reads)
+                                self.assertIsInstance(batch, aastore.Batch)
+                                self.assertEqual(list(batch), [self.sequences[id]])
+                                self.assertEqual(list(batch), list(store.get([id], reads)))
+                                self.assertEqual(batch.stats.requested_sequences, 1)
+                                self.assertLessEqual(batch.stats.workers, 1)
+                                self.check_stats(batch.stats, diagnostics)
+                                self.check_layout(batch, [self.sequences[id]], terminated=True)
+                                output = bytearray(b"#" * (len(self.sequences[id]) + 1))
+                                stats = store.get_into(id=id, output=output, options=reads)
+                                self.assertEqual(output, self.sequences[id].encode() + b"#")
+                                self.assertEqual(stats.requested_sequences, 1)
+                                self.check_stats(stats, diagnostics)
+                self.assertEqual(len(store.get([])), 0)
+                self.assertIsInstance(store[1], str)
+                self.assertEqual(store.get_into(0, None).requested_residues, 0)
+                output = bytearray(b"######")
+                for invalid in (None, b"######", "######", bytearray(5),
+                                memoryview(bytearray(12))[::2]):
+                    with self.assertRaises((ValueError, TypeError, BufferError)):
+                        store.get_into(1, invalid)
+                with self.assertRaises(IndexError):
+                    store.get_into(len(store), output)
+                self.assertEqual(output, b"######")
+                view = store.get(1).view(0)
+            gc.collect()
+            self.assertEqual(bytes(view), self.sequences[1].encode())
+
     # 保留零线程、零队列和零预算的既有语义，校验不负责探测后端可用性。
     def test_zero_option_budgets(self):
         options = aastore.ReadOptions(
             threads=0, io_queue_depth=0, io_buffer_bytes=0, input_sorted=True,
             merge_gap_bytes=0, max_merged_range_bytes=0,
-            max_exact_merged_range_bytes=0, scan_max_range_bytes=0,
+            max_exact_merged_range_bytes=0,
         )
         for backend in (aastore.IoBackend.Auto, aastore.IoBackend.Pread, aastore.IoBackend.IoUring):
-            for strategy in (aastore.ReadStrategy.Sparse, aastore.ReadStrategy.Scan):
-                options.io_backend = backend
-                options.read_strategy = strategy
-                self.assertIsNone(options.validate())
+            options.io_backend = backend
+            self.assertIsNone(options.validate())
         options.io_backend = aastore.IoBackend.Pread
         ids = [1, 1, 3, 5]
         expected = [self.sequences[i] for i in ids]
@@ -214,13 +260,24 @@ class PythonInterfaceTest(unittest.TestCase):
             )
             self.assertIsNone(store_options.validate())
             with aastore.Store(self.path, store_options) as store:
-                for strategy in (aastore.ReadStrategy.Sparse, aastore.ReadStrategy.Scan):
-                    options.read_strategy = strategy
-                    self.assertEqual(list(store.batch_get(ids, options)), expected)
-                    self.assertEqual(list(store.sequential_get(3, 6, options)), self.sequences[3:6])
-                    buffers = [bytearray(len(sequence)) for sequence in expected]
-                    store.batch_get_into(ids, buffers, options)
-                    self.assertEqual(buffers, [sequence.encode() for sequence in expected])
+                self.assertEqual(list(store.get(ids, options)), expected)
+                self.assertEqual(list(store.sequential_get(3, 6, options)), self.sequences[3:6])
+                buffers = [bytearray(len(sequence)) for sequence in expected]
+                store.get_into(ids, buffers, options)
+                self.assertEqual(buffers, [sequence.encode() for sequence in expected])
+
+    # 已删除的策略选项必须报错，不能被静默接受。
+    def test_removed_scan_options(self):
+        self.assertFalse(hasattr(aastore, "ReadStrategy"))
+        for field, value in (("read_strategy", 0), ("scan_max_range_bytes", 0)):
+            with self.subTest(field=field):
+                with self.assertRaises(TypeError):
+                    aastore.ReadOptions(**{field: value})
+                self.assertFalse(hasattr(aastore.ReadOptions(), field))
+        with aastore.Store(self.path) as store:
+            stats = store.get([]).stats
+            for field in ("sparse_ranges", "scan_ranges"):
+                self.assertFalse(hasattr(stats, field))
 
     # 覆盖各驻留模式、后端与线程预算，比较索引、切片、顺读和诊断结果。
     def test_reads(self):
@@ -237,7 +294,7 @@ class PythonInterfaceTest(unittest.TestCase):
                 self.assertIsInstance(store.decode_kernel_name, str)
                 self.assertGreater(store.resident_text_bytes, 0)
                 for i, value in enumerate(self.sequences):
-                    self.assertEqual(store.get(i), value)
+                    self.assertEqual(store.get(i)[0], value)
                     self.assertEqual(store.sequence_length(i), len(value))
                 self.assertEqual(store[-1], self.sequences[-1])
                 for backend in self.backends:
@@ -248,7 +305,7 @@ class PythonInterfaceTest(unittest.TestCase):
                                     threads=threads, io_backend=backend, merge_gap_bytes=0,
                                     io_queue_depth=2, collect_diagnostics=diagnostics,
                                 )
-                                batch = store.batch_get((i for i in ids), options)
+                                batch = store.get((i for i in ids), options)
                                 self.assertIsInstance(batch, aastore.Batch)
                                 self.assertEqual(len(batch), len(ids))
                                 self.assertEqual(batch.size(), len(ids))
@@ -272,7 +329,7 @@ class PythonInterfaceTest(unittest.TestCase):
                                     self.assertEqual(len(sequential.storage), sum(map(len, self.sequences[begin:end])))
                                     self.assertFalse(sequential.stats.io_uring)
                                     self.check_stats(sequential.stats, diagnostics)
-                                empty = store.batch_get([], options)
+                                empty = store.get([], options)
                                 self.assertTrue(empty.empty())
                                 self.assertEqual(list(empty), [])
                                 self.assertEqual(bytes(memoryview(empty)), b"")
@@ -335,10 +392,10 @@ class PythonInterfaceTest(unittest.TestCase):
                      aastore.StorageMode.FullMemory):
             with self.subTest(mode=mode), aastore.Store(path, aastore.StoreOptions(
                     storage_mode=mode, cache_bytes=max(1, stats.packed_bytes // 2))) as store:
-                self.check_layout(store.batch_get(ids, options),
+                self.check_layout(store.get(ids, options),
                                   [sequences[i] for i in ids], terminated=True)
                 self.check_layout(store.sequential_get(0, len(sequences), options), sequences)
-                self.check_layout(store.batch_get([], options), [], terminated=True)
+                self.check_layout(store.get([], options), [], terminated=True)
                 self.check_layout(store.sequential_get(2, 2, options), [])
                 records = store.batch_get_records(ids, options=options)
                 self.check_layout(records.sequences, [sequences[i] for i in ids], terminated=True)
@@ -353,8 +410,8 @@ class PythonInterfaceTest(unittest.TestCase):
                 with self.assertRaises(AttributeError):
                     records.names.stats.requested_bytes = 0
 
-    # 每条序列占 50 packed 字节，按已知文件区间检验 Scan 与零/非零合并预算。
-    def test_read_strategy_and_budgets(self):
+    # 每条序列占 50 packed 字节，按已知文件区间检验零/非零合并预算。
+    def test_range_budgets(self):
         fasta = self.root / "range-budget.fasta"
         path = self.root / "range-budget-store"
         alphabet = "ACDEFGHIKLMNPQRSTVWY"
@@ -366,55 +423,59 @@ class PythonInterfaceTest(unittest.TestCase):
         sparse_ids, adjacent_ids = [0, 0, 2, 4, 6], [0, 0, 1, 2, 3]
         # 预算只限制合并结果，零取消限额；单条读取本身仍必须完整执行。
         cases = [
-            ("sparse-gap-limited", sparse_ids, aastore.ReadStrategy.Sparse,
-             50, 100, 0, 0, 256, (4, 200, 50, 4, 0, 0)),
-            ("sparse-gap-unlimited", sparse_ids, aastore.ReadStrategy.Sparse,
-             50, 0, 0, 0, 0, (1, 350, 350, 1, 0, 3)),
-            ("scan-limited", sparse_ids, aastore.ReadStrategy.Scan,
-             0, 75, 50, 150, 256, (2, 300, 150, 0, 2, 2)),
-            ("scan-unlimited", sparse_ids, aastore.ReadStrategy.Scan,
-             0, 0, 0, 0, 0, (1, 350, 350, 0, 1, 3)),
-            ("exact-limited", adjacent_ids, aastore.ReadStrategy.Sparse,
-             0, 1, 75, 0, 256, (4, 200, 50, 4, 0, 0)),
-            ("exact-unlimited", adjacent_ids, aastore.ReadStrategy.Sparse,
-             0, 1, 0, 0, 0, (1, 200, 200, 1, 0, 0)),
+            ("sparse-gap-limited", sparse_ids,
+             50, 100, 0, 256, (4, 200, 50, 0)),
+            ("sparse-gap-unlimited", sparse_ids,
+             50, 0, 0, 0, (1, 350, 350, 3)),
+            ("sparse-zero-gap", sparse_ids,
+             0, 0, 0, 0, (4, 200, 50, 0)),
+            ("exact-limited", adjacent_ids,
+             0, 1, 75, 256, (4, 200, 50, 0)),
+            ("exact-unlimited", adjacent_ids,
+             0, 1, 0, 0, (1, 200, 200, 0)),
         ]
         with aastore.Store(path) as store:
-            for label, ids, strategy, gap, merged, exact, scan, buffer_bytes, expected in cases:
+            for label, ids, gap, merged, exact, buffer_bytes, expected in cases:
                 for backend in self.backends:
                     with self.subTest(case=label, backend=backend):
                         # input_sorted 是调用方承诺，当前实现不会验证非法顺序。
                         options = aastore.ReadOptions(
                             threads=2, io_backend=backend, input_sorted=True,
-                            read_strategy=strategy, merge_gap_bytes=gap,
+                            merge_gap_bytes=gap,
                             max_merged_range_bytes=merged, max_exact_merged_range_bytes=exact,
-                            scan_max_range_bytes=scan, io_buffer_bytes=buffer_bytes,
+                            io_buffer_bytes=buffer_bytes,
                         )
-                        batch = store.batch_get(ids, options)
+                        batch = store.get(ids, options)
                         self.assertEqual(list(batch), [sequences[i] for i in ids])
                         stats = batch.stats
                         self.assertEqual(stats.requested_sequences, 5)
                         self.assertEqual(stats.requested_residues, 400)
-                        self.assertEqual(stats.unique_packed_bytes, 200)
-                        fields = ("ranges", "read_bytes", "max_range_bytes", "sparse_ranges",
-                                  "scan_ranges", "merged_gaps")
-                        self.assertEqual(tuple(getattr(stats, field) for field in fields), expected)
-                        self.assertEqual(stats.overread_bytes, stats.read_bytes - 200)
+                        fields = ("ranges", "read_bytes", "max_range_bytes")
+                        self.assertEqual(tuple(getattr(stats, field) for field in fields), expected[:3])
                         self.check_stats(stats, False)
+                        options.collect_diagnostics = True
+                        measured = store.get(ids, options)
+                        self.assertEqual(list(measured), list(batch))
+                        self.assertEqual(measured.stats.unique_packed_bytes, 200)
+                        self.assertEqual(measured.stats.overread_bytes, stats.read_bytes - 200)
+                        self.assertEqual(measured.stats.merged_gaps, expected[3])
+                        self.assertEqual(tuple(getattr(measured.stats, field) for field in fields),
+                                         expected[:3])
+                        self.check_stats(measured.stats, True)
                         with self.assertRaises(AttributeError):
                             stats.read_bytes = 0
 
     # 保留临时批次或记录子批次的视图，确认父对象销毁后数据仍有效且不可写。
     def test_view_lifetime(self):
         store = aastore.Store(self.path)
-        view = store.batch_get([1]).view(0)
-        whole = store.batch_get([1]).storage
-        iterator = iter(store.batch_get([1, 3]))
+        view = store.get([1]).view(0)
+        whole = store.get([1]).storage
+        iterator = iter(store.get([1, 3]))
         records = store.batch_get_records([1])
         child = records.descriptions
         text_view = child.view(0)
-        offsets = store.batch_get([1, 0, 1]).offsets[::2]
-        batch = store.batch_get([1, 0, 1])
+        offsets = store.get([1, 0, 1]).offsets[::2]
+        batch = store.get([1, 0, 1])
         lengths = batch.lengths[::-1]
         expected_offsets = offsets.tolist()
         sequential_lengths = store.sequential_get(0, 2).lengths
@@ -455,7 +516,7 @@ class PythonInterfaceTest(unittest.TestCase):
             with self.open_store(mode) as store:
                 for backend in self.backends:
                     options = aastore.ReadOptions(threads=4, io_backend=backend)
-                    cases = [(ids, lambda outputs: store.batch_get_into(ids, outputs, options)),
+                    cases = [(ids, lambda outputs: store.get_into(ids, outputs, options)),
                              (list(range(6)), lambda outputs: store.sequential_get_into(0, 6, outputs, options))]
                     for requested, read in cases:
                         buffers = [bytearray(b"#" * (len(self.sequences[i]) + 2)) for i in requested]
@@ -469,14 +530,14 @@ class PythonInterfaceTest(unittest.TestCase):
                                 self.assertEqual(buffer[1:-1], self.sequences[i].encode())
                                 self.assertEqual((buffer[0], buffer[-1]), (35, 35))
                 output = bytearray(len(self.sequences[1]))
-                store.batch_get_into([1], [output])
+                store.get_into([1], [output])
                 output.append(35)
                 self.assertEqual(output[:-1], self.sequences[1].encode())
                 typed = array.array("B", [0] * len(self.sequences[1]))
-                store.batch_get_into([1], [typed])
+                store.get_into([1], [typed])
                 self.assertEqual(typed.tobytes(), self.sequences[1].encode())
-                self.assertEqual(store.batch_get_into([], []).requested_sequences, 0)
-                self.assertEqual(store.batch_get_into([0], [None]).requested_residues, 0)
+                self.assertEqual(store.get_into([], []).requested_sequences, 0)
+                self.assertEqual(store.get_into([0], [None]).requested_residues, 0)
 
     # 拒绝非法输出，在全部校验完成前不写入任何合法输出区。
     def test_invalid_outputs(self):
@@ -488,20 +549,20 @@ class PythonInterfaceTest(unittest.TestCase):
             for outputs in invalid:
                 with self.subTest(outputs=repr(outputs)):
                     with self.assertRaises((ValueError, TypeError, BufferError)):
-                        store.batch_get_into([1], outputs)
+                        store.get_into([1], outputs)
                     self.assertEqual(valid, b"#" * len(valid))
             with self.assertRaises(IndexError):
-                store.batch_get_into([len(store)], [valid])
+                store.get_into([len(store)], [valid])
             for outputs in ([valid, bytearray(1)], [valid, None], [valid, b"readonly"]):
                 with self.assertRaises((ValueError, BufferError)):
-                    store.batch_get_into([1, 1], outputs)
+                    store.get_into([1, 1], outputs)
                 self.assertEqual(valid, b"#" * len(valid))
             arena = bytearray(b"#" * 12)
             with self.assertRaises(ValueError):
-                store.batch_get_into([1, 1], [memoryview(arena)[:6], memoryview(arena)[5:11]])
+                store.get_into([1, 1], [memoryview(arena)[:6], memoryview(arena)[5:11]])
             with self.assertRaises(ValueError):
-                store.batch_get_into([1, 1], [valid, valid])
-            store.batch_get_into([1, 1], [memoryview(arena)[:6], memoryview(arena)[6:]])
+                store.get_into([1, 1], [valid, valid])
+            store.get_into([1, 1], [memoryview(arena)[:6], memoryview(arena)[6:]])
             self.assertEqual(arena, 2 * self.sequences[1].encode())
             with self.assertRaises(ValueError):
                 store.sequential_get_into(1, 2, [])
@@ -514,7 +575,7 @@ class PythonInterfaceTest(unittest.TestCase):
             options = aastore.ReadOptions(threads=2)
             ids = [1, 12, 13, 14, 1, 0]
             with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = [pool.submit(store.batch_get, ids, options) for _ in range(24)]
+                futures = [pool.submit(store.get, ids, options) for _ in range(24)]
                 for future in futures:
                     self.assertEqual(list(future.result()), [self.sequences[i] for i in ids])
 
@@ -533,7 +594,7 @@ class PythonInterfaceTest(unittest.TestCase):
             yield output
 
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(store.batch_get_into, [1], outputs(), options)
+            future = pool.submit(store.get_into, [1], outputs(), options)
             try:
                 self.assertTrue(entered.wait(10))
                 store.close()
@@ -548,7 +609,7 @@ class PythonInterfaceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.get(1)
         with self.assertRaises(ValueError):
-            store.batch_get([1])
+            store.get([1])
         with self.assertRaises(ValueError):
             store.__enter__()
 
@@ -570,7 +631,7 @@ class PythonInterfaceTest(unittest.TestCase):
             try:
                 sys.setswitchinterval(1.0)
                 active.set()
-                batch = store.batch_get([2] * 32, aastore.ReadOptions(threads=1))
+                batch = store.get([2] * 32, aastore.ReadOptions(threads=1))
                 active.clear()
                 self.assertEqual(batch[0], self.sequences[2])
                 self.assertGreater(progress[0], 0)

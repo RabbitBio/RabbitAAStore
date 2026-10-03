@@ -183,10 +183,13 @@ void check_public_store(bool available) {
     aastore::ReadOptions options;
     options.threads = 1;
     const std::vector<aastore::SequenceId> ids{1, 0};
-    const auto sequences = store.batch_get(ids, options);
+    const auto sequences = store.get(ids, options);
     check(sequences[0] == "WYACDEFG" &&
           sequences[1] == "ACDEFGHIKLMNPQRSTVWY", "Auto returned wrong sequences");
     check(sequences.stats.io_uring == available, "Auto used the wrong backend");
+    const auto single = store.get(1, options);
+    check(single.size() == 1 && single[0] == "WYACDEFG" &&
+          single.stats.io_uring == available, "single Auto get used the wrong backend");
     const auto records = store.batch_get_records(
         ids, aastore::RecordFields::All, options);
     check(records.name(0) == "second" && records.name(1) == "first",
@@ -200,10 +203,13 @@ void check_public_store(bool available) {
           "text columns used the wrong backend");
     options.io_backend = aastore::IoBackend::IoUring;
     if (available) {
-        check(store.batch_get(ids, options)[0] == "WYACDEFG",
+        check(store.get(ids, options)[0] == "WYACDEFG",
               "explicit io_uring returned wrong data");
+        check(store.get(1, options)[0] == "WYACDEFG",
+              "single explicit io_uring returned wrong data");
     } else {
-        expect_runtime_error([&] { store.batch_get(ids, options); }, "io_uring unavailable");
+        expect_runtime_error([&] { store.get(ids, options); }, "io_uring unavailable");
+        expect_runtime_error([&] { store.get(1, options); }, "io_uring unavailable");
         expect_runtime_error([&] {
             store.batch_get_records(ids, aastore::RecordFields::Name, options);
         }, "io_uring unavailable for text column");
@@ -375,7 +381,7 @@ int main() {
             aastore::Store store(fixture.store);
             aastore::ReadOptions options;
             options.threads = 1;
-            expect_runtime_error([&] { store.batch_get({0}, options); }, std::strerror(EIO));
+            expect_runtime_error([&] { store.get({0}, options); }, std::strerror(EIO));
             expect_runtime_error([&] {
                 store.batch_get_records({0}, aastore::RecordFields::Name, options);
             }, std::strerror(EIO));

@@ -40,10 +40,10 @@ int main() {
         if (built.sequences != 2 || built.residues != 19)
             throw std::runtime_error("unexpected build statistics");
         aastore::Store store(database);
-        if (store.size() != 2 || store.get(0) != "ACDEFGHIK" ||
-            store.get(1) != "MNPQRSTVWY")
+        if (store.size() != 2 || store.get(0).view(0) != "ACDEFGHIK" ||
+            store.get(1).view(0) != "MNPQRSTVWY")
             throw std::runtime_error("installed SDK sequence roundtrip failed");
-        const auto batch = store.batch_get(std::vector<aastore::SequenceId>{1, 0, 1});
+        const auto batch = store.get(std::vector<aastore::SequenceId>{1, 0, 1});
         if (batch.size() != 3 || batch[0] != "MNPQRSTVWY" ||
             batch[1] != "ACDEFGHIK" || batch[2] != "MNPQRSTVWY")
             throw std::runtime_error("installed SDK batch roundtrip failed");

@@ -75,17 +75,12 @@ void check_valid_options(const Fixture& fixture) {
     options.merge_gap_bytes = 0;
     options.max_merged_range_bytes = 0;
     options.max_exact_merged_range_bytes = 0;
-    options.scan_max_range_bytes = 0;
     options.input_sorted = true;
     for (const auto backend : {aastore::IoBackend::Auto,
                                aastore::IoBackend::Pread,
                                aastore::IoBackend::IoUring}) {
-        for (const auto strategy : {aastore::ReadStrategy::Sparse,
-                                    aastore::ReadStrategy::Scan}) {
-            options.io_backend = backend;
-            options.read_strategy = strategy;
-            options.validate();
-        }
+        options.io_backend = backend;
+        options.validate();
     }
     options.io_backend = aastore::IoBackend::Pread;
     const std::vector<aastore::SequenceId> ids{0, 1, 1, 2};
@@ -98,7 +93,7 @@ void check_valid_options(const Fixture& fixture) {
         store_options.threads = 0;
         store_options.validate();
         aastore::Store store(fixture.path, store_options);
-        const auto batch = store.batch_get(ids, options);
+        const auto batch = store.get(ids, options);
         for (size_t i = 0; i < ids.size(); ++i) {
             expect(batch.view(i) == fixture.sequences[ids[i]],
                    "zero budgets preserve reads and repeated sorted IDs");
@@ -126,7 +121,7 @@ void check_invalid_build(const Fixture& fixture) {
         aastore::build_fasta(fixture.fasta, fixture.path, options);
     }, "invalid build before overwriting an existing store");
     aastore::Store store(fixture.path);
-    expect(store.size() == fixture.sequences.size() && store.get(1) == fixture.sequences[1],
+    expect(store.size() == fixture.sequences.size() && store.get(1).view(0) == fixture.sequences[1],
            "invalid overwrite preserves the existing store");
 }
 
@@ -157,16 +152,16 @@ void check_invalid_reads(const Fixture& fixture) {
         store_options.resident_names = true;
         store_options.resident_descriptions = true;
         aastore::Store store(fixture.path, store_options);
-        for (bool invalid_backend : {false, true}) {
+        for (const auto backend : {static_cast<aastore::IoBackend>(99),
+                                    static_cast<aastore::IoBackend>(255)}) {
             aastore::ReadOptions options;
-            options.io_backend = invalid_backend ? static_cast<aastore::IoBackend>(99)
-                                                 : aastore::IoBackend::Pread;
-            options.read_strategy = invalid_backend ? aastore::ReadStrategy::Sparse
-                                                    : static_cast<aastore::ReadStrategy>(99);
+            options.io_backend = backend;
             expect_invalid([&] { options.validate(); }, "public ReadOptions validation");
+            expect_invalid([&] { store.get(1, options); }, "single get validates options");
+            expect_invalid([&] { store.get({}, options); }, "empty initializer-list get validates options");
             for (const auto& ids : {std::vector<aastore::SequenceId>{1},
                                     std::vector<aastore::SequenceId>{}}) {
-                expect_invalid([&] { store.batch_get(ids, options); }, "batch_get");
+                expect_invalid([&] { store.get(ids, options); }, "get");
                 for (const auto fields : {aastore::RecordFields::None,
                                           aastore::RecordFields::Name,
                                           aastore::RecordFields::Description,
@@ -177,13 +172,13 @@ void check_invalid_reads(const Fixture& fixture) {
                 }
                 std::string output(fixture.sequences[1].size(), '#');
                 std::vector<char*> outputs(ids.size(), output.data());
-                expect_invalid([&] { store.batch_get_into(ids, outputs, options); },
-                               "batch_get_into vector overload");
+                expect_invalid([&] { store.get_into(ids, outputs, options); },
+                               "get_into vector overload");
                 expect(output == std::string(output.size(), '#'),
                        "invalid batch options do not modify vector outputs");
                 expect_invalid([&] {
-                    store.batch_get_into(ids, outputs.data(), outputs.size(), options);
-                }, "batch_get_into pointer overload");
+                    store.get_into(ids, outputs.data(), outputs.size(), options);
+                }, "get_into pointer overload");
                 expect(output == std::string(output.size(), '#'),
                        "invalid batch options do not modify pointer outputs");
             }

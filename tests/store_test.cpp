@@ -96,6 +96,8 @@ void check_diagnostic_stats(const aastore::BatchStats& stats, bool enabled) {
     if (!enabled) {
         using S = aastore::BatchStats;
         static constexpr uint64_t S::* fields[] = {
+            &S::cache_hit_residues, &S::cache_miss_residues, &S::unique_packed_bytes,
+            &S::merged_gaps, &S::free_merges, &S::overread_bytes,
             &S::io_submit_calls, &S::io_submit_ns, &S::io_wait_calls, &S::io_empty_waits,
             &S::layout_ns, &S::sort_ns, &S::range_plan_ns, &S::worker_wall_ns,
             &S::worker_max_busy_ns, &S::read_ns, &S::decode_ns, &S::cache_decode_ns
@@ -108,6 +110,11 @@ void check_diagnostic_stats(const aastore::BatchStats& stats, bool enabled) {
                "enabled diagnostics measure layout, workers and decode");
         if (stats.cache_hits != 0) {
             expect(stats.cache_decode_ns > 0, "enabled diagnostics measure prefix decode");
+        }
+        if (stats.prefix_memory && (stats.cache_hits != 0 || stats.cache_misses != 0)) {
+            expect(stats.cache_hit_residues + stats.cache_miss_residues ==
+                       stats.requested_residues,
+                   "prefix diagnostics account for residues including duplicate IDs");
         }
         if (stats.io_uring) {
             expect(stats.io_submit_calls > 0 && stats.io_submit_ns > 0 &&
@@ -122,9 +129,7 @@ void check_basic_stats(const aastore::BatchStats& left, const aastore::BatchStat
     using S = aastore::BatchStats;
     static constexpr uint64_t S::* fields[] = {
         &S::requested_sequences, &S::requested_residues, &S::cache_hits, &S::cache_misses,
-        &S::cache_hit_residues, &S::cache_miss_residues, &S::unique_packed_bytes,
-        &S::ranges, &S::sparse_ranges, &S::scan_ranges, &S::merged_gaps, &S::free_merges,
-        &S::read_bytes, &S::overread_bytes, &S::max_range_bytes,
+        &S::ranges, &S::read_bytes, &S::max_range_bytes,
         &S::workers, &S::io_workers, &S::decode_workers, &S::io_submissions, &S::io_completions
     };
     expect(left.full_memory == right.full_memory && left.prefix_memory == right.prefix_memory &&
@@ -134,14 +139,47 @@ void check_basic_stats(const aastore::BatchStats& left, const aastore::BatchStat
     }
 }
 
+// 用已知区间验证串行/并行规划，诊断开关不改变范围及缓冲预算。
+void check_planner_diagnostics() {
+    for (size_t copies : {size_t{1}, size_t{14000}}) {
+        aastore::SequenceRequests requests;
+        const std::array<uint64_t, 5> starts{0, 1, 2, 16, 24};
+        const std::array<uint64_t, 5> lengths{1, 1, 0, 8, 8};
+        for (size_t id = 0; id < starts.size(); ++id) {
+            for (size_t copy = 0; copy < copies; ++copy) {
+                requests.push_back({id, requests.size(), starts[id], lengths[id]});
+            }
+        }
+        for (size_t threads : {size_t{1}, size_t{8}}) {
+            for (bool diagnostics : {false, true}) {
+                aastore::ReadOptions options;
+                options.threads = threads;
+                options.collect_diagnostics = diagnostics;
+                const auto plan = aastore::plan_byte_ranges(requests, options);
+                expect(plan.ranges.size() == 1 && plan.ranges[0].begin == 0 &&
+                           plan.ranges[0].end == 20 && plan.ranges[0].request_begin == 0 &&
+                           plan.ranges[0].request_end == requests.size(),
+                       "diagnostics preserve serial and parallel range boundaries");
+                expect(plan.requested_residues == 18 * copies &&
+                           plan.read_bytes == 20 && plan.max_range_bytes == 20,
+                       "diagnostics preserve basic planner counts and buffer sizing");
+                expect(plan.unique_packed_bytes == (diagnostics ? 12 : 0) &&
+                           plan.merged_gaps == (diagnostics ? 1 : 0) &&
+                           plan.free_merges == (diagnostics ? 4 * copies - 2 : 0),
+                       "optional planner counts handle duplicates, shared bytes and empty sequences");
+            }
+        }
+    }
+}
+
 // 对同一批次开关诊断各读一次，检查内容及基本统计一致，返回未启用诊断的结果。
 aastore::Batch check_batch_diagnostics(const aastore::Store& store,
                                        const std::vector<aastore::SequenceId>& ids,
                                        aastore::ReadOptions options) {
     options.collect_diagnostics = false;
-    auto plain = store.batch_get(ids, options);
+    auto plain = store.get(ids, options);
     options.collect_diagnostics = true;
-    const auto measured = store.batch_get(ids, options);
+    const auto measured = store.get(ids, options);
     check_diagnostic_stats(plain.stats, false);
     check_diagnostic_stats(measured.stats, true);
     check_basic_stats(plain.stats, measured.stats);
@@ -171,8 +209,8 @@ void check_batch_get_into(const aastore::Store& store,
         reads.collect_diagnostics = round >= 2;
         for (auto& buffer : buffers) std::fill(buffer.begin(), buffer.end(), '#');
         const auto stats = round % 2 == 0
-            ? store.batch_get_into(ids, outputs, reads)
-            : store.batch_get_into(ids, outputs.data(), outputs.size(), reads);
+            ? store.get_into(ids, outputs, reads)
+            : store.get_into(ids, outputs.data(), outputs.size(), reads);
         check_diagnostic_stats(stats, reads.collect_diagnostics);
         if (round == 0) baseline = stats;
         else check_basic_stats(baseline, stats);
@@ -278,7 +316,7 @@ void check_even_record_metadata(const std::filesystem::path& root) {
     expect(store.size() == 2 && store.total_residues() == 9 &&
                store.sequence_length(0) == 6 && store.sequence_length(1) == 3,
            "even-record metadata preserves sequence boundaries");
-    const auto batch = store.batch_get({1, 0});
+    const auto batch = store.get({1, 0});
     expect(batch[0] == "MKT" && batch[1] == "ACDEFG",
            "even-record metadata supports reordered sequence reads");
 }
@@ -569,7 +607,7 @@ void StoreFixture::check_builder() {
                    sequence_only_path / "descriptions.bin") &&
                !std::filesystem::exists(
                    sequence_only_path / "descriptions.meta") &&
-               sequence_only_store.get(1) == expected[1],
+               sequence_only_store.get(1).view(0) == expected[1],
            "sequence-only build omits both annotation columns");
     bool annotation_rejected = false;
     try {
@@ -690,9 +728,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
 #endif
     aastore::Store store(store_path);
     expect(!aastore::ReadOptions{}.collect_diagnostics, "read diagnostics default to disabled");
-    expect(aastore::ReadOptions{}.read_strategy ==
-               aastore::ReadStrategy::Sparse &&
-               aastore::ReadOptions{}.merge_gap_bytes == 4096 &&
+    expect(aastore::ReadOptions{}.merge_gap_bytes == 4096 &&
                aastore::ReadOptions{}.max_merged_range_bytes == 16384 &&
                aastore::ReadOptions{}.max_exact_merged_range_bytes ==
                    1024 * 1024,
@@ -701,13 +737,13 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
     expect(store.has_names() && store.has_descriptions(),
            "opened name and description columns");
     for (size_t i = 0; i < expected.size(); ++i) {
-        expect(store.get(i) == expected[i],
+        expect(store.get(i).view(0) == expected[i],
                "single get " + std::to_string(i));
         expect(store.sequence_length(i) == expected[i].size(),
                "sequence length " + std::to_string(i));
     }
     const std::vector<aastore::SequenceId> ids = {6, 1, 0, 3, 5, 1};
-    const aastore::Batch batch = store.batch_get(ids);
+    const aastore::Batch batch = store.get(ids);
     expect(batch.size() == ids.size(), "batch size");
     expect(!batch.empty(), "batch is not empty");
     static_assert(std::is_same_v<decltype(batch[0]), std::string>,
@@ -720,7 +756,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
     }
     std::string owned_sequence;
     {
-        const aastore::Batch temporary = store.batch_get({1});
+        const aastore::Batch temporary = store.get({1});
         owned_sequence = temporary[0];
     }
     expect(owned_sequence == expected[1],
@@ -734,14 +770,15 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
         planner_ids[i] = planner_pattern[i % planner_pattern.size()];
     }
     aastore::ReadOptions serial_plan_options;
+    serial_plan_options.collect_diagnostics = true;
     serial_plan_options.io_backend = aastore::IoBackend::Pread;
     serial_plan_options.threads = 1;
     aastore::ReadOptions parallel_plan_options = serial_plan_options;
     parallel_plan_options.threads = 8;
     const aastore::Batch serial_plan_batch =
-        store.batch_get(planner_ids, serial_plan_options);
+        store.get(planner_ids, serial_plan_options);
     const aastore::Batch parallel_plan_batch =
-        store.batch_get(planner_ids, parallel_plan_options);
+        store.get(planner_ids, parallel_plan_options);
     expect(serial_plan_batch.stats.ranges ==
                parallel_plan_batch.stats.ranges &&
                serial_plan_batch.stats.merged_gaps ==
@@ -769,22 +806,16 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
             serial_options.merge_gap_bytes = 0;
             serial_options.max_merged_range_bytes = 0;
         } else {
-            serial_options.read_strategy = aastore::ReadStrategy::Scan;
-            serial_options.merge_gap_bytes = 0;
+            serial_options.merge_gap_bytes = 4096;
             serial_options.max_merged_range_bytes = 4096;
-            serial_options.scan_max_range_bytes = 0;
         }
         aastore::ReadOptions parallel_options = serial_options;
         parallel_options.threads = 8;
         const aastore::Batch serial_result =
-            store.batch_get(planner_ids, serial_options);
+            store.get(planner_ids, serial_options);
         const aastore::Batch parallel_result =
-            store.batch_get(planner_ids, parallel_options);
+            store.get(planner_ids, parallel_options);
         expect(serial_result.stats.ranges == parallel_result.stats.ranges &&
-                   serial_result.stats.sparse_ranges ==
-                       parallel_result.stats.sparse_ranges &&
-                   serial_result.stats.scan_ranges ==
-                       parallel_result.stats.scan_ranges &&
                    serial_result.stats.merged_gaps ==
                        parallel_result.stats.merged_gaps &&
                    serial_result.stats.free_merges ==
@@ -809,7 +840,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
         uring_options.threads = 3;
         uring_options.io_queue_depth = 4;
         uring_options.merge_gap_bytes = 0;
-        const aastore::Batch uring_batch = store.batch_get(ids, uring_options);
+        const aastore::Batch uring_batch = store.get(ids, uring_options);
         for (size_t i = 0; i < ids.size(); ++i) {
             expect(uring_batch.view(i) == expected[ids[i]],
                    "io_uring batch preserves request order " +
@@ -830,35 +861,32 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
 
     // 对齐后 p0 与 p1 的起始位置相差一个 4 KiB packed 页。
     aastore::ReadOptions sparse_options;
-    sparse_options.read_strategy = aastore::ReadStrategy::Sparse;
-    const aastore::Batch merged = store.batch_get({1, 3}, sparse_options);
+    sparse_options.collect_diagnostics = true;
+    const aastore::Batch merged = store.get({1, 3}, sparse_options);
     expect(merged.stats.ranges == 1, "4 KiB gap merges");
     expect(merged.stats.merged_gaps == 1, "merged gap is counted");
 
     aastore::ReadOptions exact_options = sparse_options;
     exact_options.merge_gap_bytes = 0;
-    const aastore::Batch exact = store.batch_get({1, 3}, exact_options);
+    const aastore::Batch exact = store.get({1, 3}, exact_options);
     expect(exact.stats.ranges == 2, "runtime zero gap keeps extents separate");
 
     aastore::ReadOptions capped_options = sparse_options;
     capped_options.max_merged_range_bytes = 4096;
-    const aastore::Batch capped = store.batch_get({1, 3}, capped_options);
+    const aastore::Batch capped = store.get({1, 3}, capped_options);
     expect(capped.stats.ranges == 2,
            "maximum range prevents an oversized chained merge");
 
     // p2 再向后一个 packed 页，与 p0 的间隔超过 4 KiB。
     const aastore::Batch separate =
-        store.batch_get({1, 5}, sparse_options);
+        store.get({1, 5}, sparse_options);
     expect(separate.stats.ranges == 2, "gap above 4 KiB stays separate");
 
-    aastore::ReadOptions scan_options = sparse_options;
-    scan_options.read_strategy = aastore::ReadStrategy::Scan;
-    scan_options.scan_max_range_bytes = 0;
-    const aastore::Batch scanned = store.batch_get({5, 1}, scan_options);
-    expect(scanned.stats.ranges == 1 && scanned.stats.scan_ranges == 1 &&
-               scanned.view(0) == expected[5] &&
-               scanned.view(1) == expected[1],
-           "forced scan coalesces the span and restores request order");
+    const aastore::Batch reordered = store.get({5, 1}, sparse_options);
+    expect(reordered.stats.ranges == 2 &&
+               reordered.view(0) == expected[5] &&
+               reordered.view(1) == expected[1],
+           "separate ranges preserve unsorted request order");
 
     aastore::StoreOptions full_options;
     full_options.storage_mode = aastore::StorageMode::FullMemory;
@@ -868,7 +896,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
            "full-memory storage mode");
     expect(full_store.resident_bytes() >= full_store.packed_bytes(),
            "full-memory mode retains all packed data");
-    const aastore::Batch full_batch = full_store.batch_get(ids);
+    const aastore::Batch full_batch = full_store.get(ids);
     for (size_t i = 0; i < ids.size(); ++i) {
         expect(full_batch.view(i) == expected[ids[i]],
                "full-memory batch preserves request order " +
@@ -882,7 +910,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
                full_batch.stats.read_ns == 0,
            "full-memory batch bypasses sort, planning, and I/O");
     for (size_t i = 0; i < expected.size(); ++i) {
-        expect(full_store.get(i) == expected[i],
+        expect(full_store.get(i).view(0) == expected[i],
                "full-memory single get " + std::to_string(i));
     }
     for (const aastore::Store* reader : {&store, &full_store}) {
@@ -909,7 +937,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
                prefix_store.resident_bytes() == kPrefixCacheBytes,
            "prefix-memory mode retains an immutable packed prefix");
     const std::vector<aastore::SequenceId> prefix_ids = {3, 1, 1, 5};
-    const aastore::Batch prefix_batch = prefix_store.batch_get(prefix_ids);
+    const aastore::Batch prefix_batch = prefix_store.get(prefix_ids);
     for (size_t i = 0; i < prefix_ids.size(); ++i) {
         expect(prefix_batch.view(i) == expected[prefix_ids[i]],
                "prefix-memory batch preserves order " +
@@ -929,7 +957,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
         options.threads = 3;
         for (size_t round = 0; round < 3; ++round) {
             const aastore::Batch mixed =
-                prefix_store.batch_get(mixed_prefix_ids, options);
+                prefix_store.get(mixed_prefix_ids, options);
             for (size_t i = 0; i < mixed_prefix_ids.size(); ++i) {
                 expect(mixed.view(i) == expected[mixed_prefix_ids[i]],
                        "prefix reads preserve duplicates and boundary-crossing sequences");
@@ -942,7 +970,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
                    "nonresident reads do not grow or replace the prefix");
         }
     }
-    const aastore::Batch prefix_hits = prefix_store.batch_get({1, 0, 1});
+    const aastore::Batch prefix_hits = prefix_store.get({1, 0, 1});
     expect(prefix_hits.view(0) == expected[1] &&
                prefix_hits.view(1).empty() &&
                prefix_hits.view(2) == expected[1] &&
@@ -952,31 +980,57 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
            "fully resident prefix batches bypass file reads");
 
     for (const aastore::Store* source : {&store, &prefix_store, &full_store}) {
+        for (const auto backend : {aastore::IoBackend::Pread, aastore::IoBackend::Auto}) {
+            for (const bool diagnostics : {false, true}) {
+                aastore::ReadOptions reads;
+                reads.io_backend = backend;
+                reads.threads = 8;
+                reads.collect_diagnostics = diagnostics;
+                for (const aastore::SequenceId id : {0, 1, 5, 7}) {
+                    const auto single = source->get(id, reads);
+                    const auto listed = source->get({id}, reads);
+                    expect(single.size() == 1 && single.view(0) == expected[id] &&
+                               single.view(0) == listed.view(0) &&
+                               single.storage.size() == expected[id].size() + 1 &&
+                               single.storage.data()[single.offsets[0] + single.lengths[0]] == '\0',
+                           "single get returns an owning one-element terminated Batch");
+                    expect(single.stats.requested_sequences == 1 &&
+                               single.stats.requested_residues == expected[id].size() &&
+                               single.stats.workers <= 1 &&
+                               single.stats.read_bytes == listed.stats.read_bytes &&
+                               single.stats.io_uring == listed.stats.io_uring,
+                           "single and one-element list get share read options and statistics");
+                    check_diagnostic_stats(single.stats, diagnostics);
+                }
+                expect(source->get({}, reads).empty(),
+                       "empty initializer list reads no sequence, not ID zero");
+            }
+        }
         std::array<char, 16> guard;
         guard.fill('#');
         std::vector<char*> outputs{guard.data(), guard.data() + 8};
         bool count_rejected = false;
         try {
-            source->batch_get_into({1}, outputs);
+            source->get_into({1}, outputs);
         } catch (const std::invalid_argument&) {
             count_rejected = true;
         }
         bool array_rejected = false;
         try {
-            source->batch_get_into({1}, nullptr, 1);
+            source->get_into({1}, nullptr, 1);
         } catch (const std::invalid_argument&) {
             array_rejected = true;
         }
         bool slot_rejected = false;
         char* null_output = nullptr;
         try {
-            source->batch_get_into({1}, &null_output, 1);
+            source->get_into({1}, &null_output, 1);
         } catch (const std::invalid_argument&) {
             slot_rejected = true;
         }
         bool id_rejected = false;
         try {
-            source->batch_get_into({1, source->size()}, outputs);
+            source->get_into({1, source->size()}, outputs);
         } catch (const std::out_of_range&) {
             id_rejected = true;
         }
@@ -985,8 +1039,8 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
                        return value == '#';
                    }),
                "direct batch rejects invalid arrays and IDs before writing");
-        const auto empty_stats = source->batch_get_into({}, nullptr, 0);
-        const auto zero_length_stats = source->batch_get_into({0}, &null_output, 1);
+        const auto empty_stats = source->get_into({}, nullptr, 0);
+        const auto zero_length_stats = source->get_into({0}, &null_output, 1);
         expect(empty_stats.requested_sequences == 0 && empty_stats.ranges == 0 &&
                    zero_length_stats.requested_sequences == 1 &&
                    zero_length_stats.requested_residues == 0 &&
@@ -994,7 +1048,7 @@ void StoreFixture::check_random([[maybe_unused]] bool io_uring_available) {
                "direct batch accepts empty requests and null outputs for empty sequences");
 
     }
-    const aastore::Batch empty = store.batch_get({});
+    const aastore::Batch empty = store.get({});
     expect(empty.empty() && empty.stats.ranges == 0,
            "empty batch");
     for (const aastore::Store* reader :
@@ -1167,6 +1221,120 @@ void StoreFixture::check_text() {
                empty_records.sequences.empty(),
            "empty record batch");
 
+    const auto text_fields = aastore::RecordFields::Name |
+        aastore::RecordFields::Description;
+    for (unsigned flags = 0; flags < 4; ++flags) {
+        const auto path = temp.path() / ("resident_text_" + std::to_string(flags));
+        std::filesystem::copy(store_path, path,
+                              std::filesystem::copy_options::recursive);
+        aastore::StoreOptions opening;
+        opening.resident_names = (flags & 1) != 0;
+        opening.resident_descriptions = (flags & 2) != 0;
+        aastore::Store loaded(path, opening);
+        const uint64_t resident_bytes =
+            (opening.resident_names ? built.name_bytes : 0) +
+            (opening.resident_descriptions ? built.description_bytes : 0);
+        expect(loaded.resident_text_bytes() == resident_bytes,
+               "resident text bytes count only enabled columns");
+
+        for (const auto backend : {aastore::IoBackend::Pread, aastore::IoBackend::Auto}) {
+            aastore::ReadOptions reading;
+            reading.io_backend = backend;
+            reading.threads = 4;
+            const auto plain = loaded.batch_get_records(ids, text_fields, reading);
+            reading.collect_diagnostics = true;
+            const auto measured = loaded.batch_get_records(ids, text_fields, reading);
+            const std::array<const aastore::TextBatch*, 2> plain_columns{
+                &plain.names, &plain.descriptions};
+            const std::array<const aastore::TextBatch*, 2> measured_columns{
+                &measured.names, &measured.descriptions};
+            for (size_t column = 0; column < plain_columns.size(); ++column) {
+                const auto& before = plain_columns[column]->stats;
+                const auto& after = measured_columns[column]->stats;
+                expect(before.unique_bytes == 0 && before.merged_gaps == 0 &&
+                           before.overread_bytes == 0 && after.unique_bytes > 0,
+                       "text amplification diagnostics are optional for resident and disk columns");
+                expect(before.resident == after.resident && before.io_uring == after.io_uring &&
+                           before.requested_strings == after.requested_strings &&
+                           before.requested_bytes == after.requested_bytes &&
+                           before.ranges == after.ranges && before.read_bytes == after.read_bytes &&
+                           before.max_range_bytes == after.max_range_bytes,
+                       "text diagnostics preserve basic counts, backend and range sizes");
+                expect(after.resident ? after.overread_bytes == 0 :
+                           after.read_bytes == after.unique_bytes + after.overread_bytes,
+                       "enabled text diagnostics report overread without underflow");
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    expect(plain_columns[column]->view(i) == measured_columns[column]->view(i),
+                           "text diagnostics preserve content, order and duplicates");
+                }
+            }
+        }
+
+        // 等长覆盖测试副本，区分自有缓冲与仍依赖源文件的只读映射。
+        for (const char* filename : {"names.bin", "descriptions.bin"}) {
+            const auto data_path = path / filename;
+            const std::string replacement(
+                static_cast<size_t>(std::filesystem::file_size(data_path)), '#');
+            std::fstream output(data_path,
+                                std::ios::binary | std::ios::in | std::ios::out);
+            output.write(replacement.data(),
+                         static_cast<std::streamsize>(replacement.size()));
+            output.close();
+            expect(static_cast<bool>(output), "overwrite test text data in place");
+        }
+        for (const auto backend : {aastore::IoBackend::Pread, aastore::IoBackend::Auto}) {
+            aastore::ReadOptions reading;
+            reading.io_backend = backend;
+            reading.threads = 4;
+            const auto result = loaded.batch_get_records(ids, text_fields, reading);
+            expect(result.names.stats.resident == opening.resident_names &&
+                       result.descriptions.stats.resident == opening.resident_descriptions,
+                   "text columns independently report owned resident data");
+            expect(!opening.resident_names ||
+                       (result.names.stats.read_bytes == 0 && !result.names.stats.io_uring),
+                   "resident names bypass file reads");
+            expect(!opening.resident_descriptions ||
+                       (result.descriptions.stats.read_bytes == 0 &&
+                        !result.descriptions.stats.io_uring),
+                   "resident descriptions bypass file reads");
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const std::string name = opening.resident_names
+                    ? expected_names[ids[i]] : std::string(expected_names[ids[i]].size(), '#');
+                const std::string description = opening.resident_descriptions
+                    ? expected_descriptions[ids[i]]
+                    : std::string(expected_descriptions[ids[i]].size(), '#');
+                expect(result.name_view(i) == name,
+                       "resident name snapshot preserves input order and duplicates");
+                expect(result.description_view(i) == description,
+                       "resident description snapshot preserves empty entries and duplicates");
+            }
+        }
+    }
+
+    for (const bool no_records : {false, true}) {
+        const auto path = temp.path() / (no_records ? "empty_text" : "empty_descriptions");
+        const auto input_path = path.string() + ".fa";
+        {
+            std::ofstream input(input_path);
+            if (!no_records) input << ">onlyname\nAC\n";
+        }
+        aastore::build_fasta(input_path, path);
+        aastore::StoreOptions opening;
+        opening.resident_names = true;
+        opening.resident_descriptions = true;
+        aastore::Store loaded(path, opening);
+        const std::vector<aastore::SequenceId> selected = no_records
+            ? std::vector<aastore::SequenceId>{} : std::vector<aastore::SequenceId>{0};
+        const auto result = loaded.batch_get_records(selected, text_fields);
+        expect(loaded.resident_text_bytes() == (no_records ? 0 : 8) &&
+                   result.size() == selected.size() && result.names.stats.resident &&
+                   result.descriptions.stats.resident,
+               "empty resident text columns are valid");
+        if (!no_records) {
+            expect(result.name_view(0) == "onlyname" && result.description_view(0).empty(),
+                   "resident reads handle a completely empty description column");
+        }
+    }
 }
 
 // 跨调用并发、总线程预算、并行直接输出和异常清理。
@@ -1267,7 +1435,10 @@ int main(int argc, char* argv[]) {
         if (!selected.empty() && selected != group) continue;
         std::cout << "aastore test group: " << group << '\n';
         if (group == "builder") fixture.check_builder();
-        else if (group == "random") fixture.check_random(io_uring_available);
+        else if (group == "random") {
+            check_planner_diagnostics();
+            fixture.check_random(io_uring_available);
+        }
         else if (group == "sequential") fixture.check_sequential();
         else if (group == "text") fixture.check_text();
         else fixture.check_concurrency(io_uring_available);

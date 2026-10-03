@@ -31,7 +31,7 @@ def main():
         with aastore.Store(path, opening) as store:
             print("版本：", aastore.__version__, "解码路径：", store.decode_kernel_name)
             print("单条：", store[0], "最后一条：", store[-1])
-            batch = store.batch_get([2, 0, 2, 1], reads)
+            batch = store.get([2, 0, 2, 1], reads)
             print("乱序、重复、空序列：", list(batch))
             print("反向切片：", batch[::-1])
             print("请求数：", batch.stats.requested_sequences)
