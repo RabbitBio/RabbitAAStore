@@ -72,24 +72,28 @@ existing data remains readable and how to migrate it.
 
 ## Selecting tests and cross-compiling
 
-The default CTest invocation runs all registered tests. Store tests have separate
+Normal builds register only the environment smoke checks. To compile the full
+suite, enter `tests/` and run `make`; generated files stay in `tests/build/`.
+`make test` then runs all registered tests. Store tests have separate
 `builder`, `random`, `sequential`, `text`, and `concurrency` labels; `options`
 covers configuration validation. The `compatibility` label covers legacy kernel
 and liburing paths through a private shim, plus CMake cross-compilation checks,
 without requiring host io_uring support.
 
 ```sh
-(cd build && ctest --output-on-failure)
-(cd build && ctest -L sequential --output-on-failure)
-(cd build && ctest -L compatibility --output-on-failure)
+cd tests
+make
+make test
+make test CTEST_ARGS='-L sequential'
+make test CTEST_ARGS='-L compatibility'
 ./build/aastore_test --group text
 ```
 
-Select a cross-compilation toolchain with `CMAKE_TOOLCHAIN_FILE`:
+From the repository root, select a cross-compilation toolchain with `CMAKE_TOOLCHAIN_FILE`:
 
 ```sh
 cmake -S . -B build-cross -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE=/path/to/toolchain.cmake
+  -DCMAKE_TOOLCHAIN_FILE=/path/to/toolchain.cmake -DAASTORE_BUILD_TESTS=ON
 cmake --build build-cross -j 4
 (cd build-cross && ctest --output-on-failure)
 ```

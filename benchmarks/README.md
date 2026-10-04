@@ -90,6 +90,7 @@ the experiment starts cold **before open**, not immediately before every fetch.
 ## Run
 
 ```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAASTORE_BUILD_BENCHMARKS=ON
 cmake --build build --target aastore_bench aastore_build -j 8
 python3 benchmarks/run_cold_matrix.py /path/to/full/store /path/to/new/results \
   --label UniRef100_2026_03 --percents 1 5 10 --threads 1 4 16 64 \
@@ -165,23 +166,3 @@ For bounded random batches and sampling without replacement, use
 `--ids-file`. Fetch metrics sum all batches and rounds; preload happens once.
 `--drop-cache` requires `--rounds 1` and a fresh process per cold repeat,
 following the same file-cache eviction and validation rules described above.
-
-## Matching MMseqs2 createdb IDs
-
-To match the physical IDs produced by ordinary MMseqs2 `createdb --shuffle 1`,
-build an input-order store and apply the default 32-way shuffle:
-
-```sh
-cmake --build build --target aastore_build aastore_reorder_createdb -j 8
-./build/aastore_build proteins.fa proteins.aastore.input-order --sequences-only
-./build/aastore_reorder_createdb \
-  proteins.aastore.input-order proteins.aastore \
-  --threads 8 --remove-source
-```
-
-The tool scans the source sequentially, routes each original ID into shard
-`id % 32`, then combines the 32 shards in order. With `--remove-source`, it
-removes the source only after the output files and directories have been synced
-and committed; a failure before that point preserves the source. The output
-contains sequences only. This ordering applies to the ordinary default
-`createdb` shuffle, not GPU or length-based reordering.

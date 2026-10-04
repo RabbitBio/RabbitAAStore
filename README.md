@@ -31,12 +31,32 @@ io_uring。维护状态见 [Linux 内核发布说明](https://www.kernel.org/cat
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 4
-(cd build && ctest --output-on-failure)
 cmake --install build --prefix "$HOME/.local"
 ```
 
 普通 C++ 构建不依赖 Python。liburing 是可选依赖；找到可用的开发库时启用
 io_uring，未找到时使用 `pread`。
+
+默认的独立构建会自动运行几个环境小测试：临时 FASTA 建库、单/多线程 `pread`、
+前缀/全内存读取、常驻文本、自动后端和 `io_uring`。启用 Python 构建时还检查扩展
+导入与读写。测试自行生成并清理小数据，不需要下载数据或 root 权限，也不是冷缓存 benchmark。
+失败会使构建返回非零；`io_uring` 不可用时该 case 显示 `Skipped` 和原因，
+不代表通过了 io_uring 测试，`Auto` 的读取仍必须通过。
+
+可用 `-DAASTORE_RUN_SMOKE_TESTS=OFF` 关闭编译后的自动检查。
+`add_subdirectory` 接入和交叉编译默认关闭自动检查；交叉运行须配置 emulator。
+只重跑小测试可用 `(cd build && ctest -L smoke -V)`。
+自动检查属于默认构建目标；显式只编译 `--target aastore` 或 Python wheel 不触发它。
+
+完整回归测试和 benchmark 默认不编译。需要测试时进入 `tests/`，直接运行：
+
+```bash
+cd tests
+make       # 编译，产物位于 tests/build/
+make test  # 可选：运行测试
+```
+
+更多选项见 [测试说明](tests/README.md)。旧构建目录会保留原来的 CMake 开关设置。
 
 在自己的 CMake 项目中链接 AAStore：
 

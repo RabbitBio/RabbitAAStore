@@ -27,8 +27,9 @@ AVX-512、AVX2/BMI2 或 scalar 编解码路径，无需为不同 SIMD 能力使�
 | CMake 选项 | 默认行为 |
 | --- | --- |
 | `AASTORE_BUILD_TOOLS` | 顶层构建开启，`add_subdirectory` 接入时关闭 |
-| `AASTORE_BUILD_BENCHMARKS` | 顶层构建开启，`add_subdirectory` 接入时关闭 |
-| `AASTORE_BUILD_TESTS` | 顶层构建开启，`add_subdirectory` 接入时关闭 |
+| `AASTORE_BUILD_BENCHMARKS` | 默认关闭，测试 Makefile 和 CI 显式开启 |
+| `AASTORE_BUILD_TESTS` | 完整回归默认关闭；进入 `tests/` 执行 `make` 编译 |
+| `AASTORE_RUN_SMOKE_TESTS` | 独立本机默认构建后自动运行环境小测试；嵌入和交叉编译默认关闭 |
 | `BUILD_SHARED_LIBS` | 顶层默认关闭，开启后构建共享库 |
 | `AASTORE_ENABLE_IO_URING` | 默认开启探测；找不到可用 liburing 时构建 pread 后端 |
 | `AASTORE_ENABLE_IPO` | 顶层默认尝试开启；GCC 9 以前默认关闭；实际启用取决于探测 |
@@ -39,7 +40,7 @@ AVX-512、AVX2/BMI2 或 scalar 编解码路径，无需为不同 SIMD 能力使�
 ```bash
 cmake -S . -B build-sdk -DCMAKE_BUILD_TYPE=Release \
   -DAASTORE_BUILD_TOOLS=OFF -DAASTORE_BUILD_BENCHMARKS=OFF \
-  -DAASTORE_BUILD_TESTS=OFF
+  -DAASTORE_BUILD_TESTS=OFF -DAASTORE_RUN_SMOKE_TESTS=OFF
 cmake --build build-sdk -j 4
 cmake --install build-sdk --prefix "$HOME/.local"
 ```
