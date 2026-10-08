@@ -52,7 +52,7 @@ io_uring，未找到时使用 `pread`。
 
 ```bash
 cd tests
-make       # 编译，产物位于 tests/build/
+make       # 编译，可执行文件直接放在 tests/
 make test  # 可选：运行测试
 ```
 

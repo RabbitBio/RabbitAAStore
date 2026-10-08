@@ -73,7 +73,8 @@ existing data remains readable and how to migrate it.
 ## Selecting tests and cross-compiling
 
 Normal builds register only the environment smoke checks. To compile the full
-suite, enter `tests/` and run `make`; generated files stay in `tests/build/`.
+suite, enter `tests/` and run `make`; executables go directly into `tests/`,
+while intermediate files and the CMake cache stay in `tests/build/`.
 `make test` then runs all registered tests. Store tests have separate
 `builder`, `random`, `sequential`, `text`, and `concurrency` labels; `options`
 covers configuration validation. The `compatibility` label covers legacy kernel
@@ -86,7 +87,7 @@ make
 make test
 make test CTEST_ARGS='-L sequential'
 make test CTEST_ARGS='-L compatibility'
-./build/aastore_test --group text
+./aastore_test --group text
 ```
 
 From the repository root, select a cross-compilation toolchain with `CMAKE_TOOLCHAIN_FILE`:

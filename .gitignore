@@ -2,6 +2,10 @@
 /build*/
 /cmake-build-*/
 /tests/build/
+/tests/aastore_build
+/tests/aastore_bench
+/tests/aastore_test
+/tests/aastore_*_test
 
 # Generated build files
 CMakeCache.txt
