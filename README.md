@@ -123,7 +123,13 @@ int main() {
 ```
 
 `batch[i]` 对应第 `i` 个请求，返回独立字符串。
-可直接编译运行、自动创建小数据库的完整项目见 [examples/cpp](examples/cpp)。
+完整示例和十万条 FASTA 数据集见 [examples](examples/README.md)，无需先安装 SDK：
+
+```bash
+cd examples
+make
+make run
+```
 
 ### Python 读取
 

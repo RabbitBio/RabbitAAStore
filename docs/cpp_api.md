@@ -5,8 +5,9 @@ AAStore 从 FASTA 建库，再通过 `Store` 按 ID 读取序列或所选记录�
 公开接口见 [store.hpp](../include/aastore/store.hpp)、
 [builder.hpp](../include/aastore/builder.hpp) 和 [read_options.hpp](../include/aastore/read_options.hpp)。
 
-建议先运行完整的 [examples/cpp/main.cpp](../examples/cpp/main.cpp)：它自行创建
-FASTA 和临时库，检查乱序及重复 ID 的结果，并自动清理。本文命令从仓库根目录运行；
+建议先进入 [examples](../examples/README.md) 执行 `make run`：它使用随项目提供的
+十万条 FASTA 数据集建库，展示乱序、重复 ID 和连续读取，并保留生成的数据库。
+本文命令从仓库根目录运行；
 C++ 片段用于函数体内，读取示例假设 `proteins.aastore` 已包含至少两条记录，统一使用：
 
 ```cpp
