@@ -201,6 +201,8 @@ public:
     uint64_t packed_bytes() const noexcept;
     // 返回当前配置的序列存储模式。
     StorageMode storage_mode() const noexcept;
+    // 返回序列及文本边界索引的加载方式，与正文存储模式独立。
+    IndexLoadMode index_load_mode() const noexcept;
     // 返回已常驻的 packed 数据字节数，不含元数据。
     uint64_t resident_bytes() const;
     // 返回已载入自有缓冲的文本数据字节数，不含文本元数据。
@@ -211,6 +213,10 @@ public:
     bool has_names() const noexcept;
     // 判断描述列是否存在。
     bool has_descriptions() const noexcept;
+    // 复用调用方字符串读取名称；并发调用须使用独立输出，不读取序列或描述。
+    void get_name_into(SequenceId id, std::string& output) const;
+    // 复用调用方字符串读取描述；并发调用须使用独立输出，不读取序列或名称。
+    void get_description_into(SequenceId id, std::string& output) const;
     // 校验 ID 后返回该序列的残基长度。
     uint64_t sequence_length(SequenceId id) const;
     // 返回当前运行时选择的解码内核名称。

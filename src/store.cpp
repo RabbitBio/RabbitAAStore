@@ -120,7 +120,8 @@ std::unique_ptr<TextColumn> open_text_column(
         const char* metadata_name,
         const char* label,
         uint64_t sequence_count,
-        bool resident) {
+        bool resident,
+        IndexLoadMode index_load_mode) {
     const std::filesystem::path data_path = store_path / data_name;
     const std::filesystem::path metadata_path = store_path / metadata_name;
     const bool data_exists = std::filesystem::exists(data_path);
@@ -132,7 +133,7 @@ std::unique_ptr<TextColumn> open_text_column(
     }
     if (!data_exists) return nullptr;
     return std::make_unique<TextColumn>(
-        data_path, metadata_path, sequence_count, resident);
+        data_path, metadata_path, sequence_count, resident, index_load_mode);
 }
 
 }  // namespace
@@ -143,7 +144,8 @@ struct Store::Impl {
 
     // 打开存储文件，并按配置初始化文本列和 packed 数据缓存。
     Impl(const std::filesystem::path& path, const StoreOptions& options)
-        : metadata_(path), storage_mode_(options.storage_mode) {
+        : metadata_(path, options.index_load_mode), storage_mode_(options.storage_mode),
+          index_load_mode_(options.index_load_mode) {
         const std::filesystem::path packed_path = path / "packed.bin";
         packed_descriptor_ = ::open(
             packed_path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -158,10 +160,10 @@ struct Store::Impl {
             }
             names_ = open_text_column(
                 path, "names.bin", "names.meta", "name", size(),
-                options.resident_names);
+                options.resident_names, options.index_load_mode);
             descriptions_ = open_text_column(
                 path, "descriptions.bin", "descriptions.meta",
-                "description", size(), options.resident_descriptions);
+                "description", size(), options.resident_descriptions, options.index_load_mode);
             if (storage_mode_ == StorageMode::FullMemory) {
                 preload_full_packed(options.threads);
                 ::close(packed_descriptor_);
@@ -197,6 +199,7 @@ struct Store::Impl {
 
     // 返回当前 Store 使用的存储模式。
     StorageMode storage_mode() const noexcept { return storage_mode_; }
+    IndexLoadMode index_load_mode() const noexcept { return index_load_mode_; }
 
     // 返回序列 packed 数据当前占用的常驻内存字节数。
     uint64_t resident_bytes() const {
@@ -223,6 +226,16 @@ struct Store::Impl {
     // 判断描述文本列是否存在。
     bool has_descriptions() const noexcept {
         return descriptions_ != nullptr;
+    }
+
+    void get_name_into(SequenceId id, std::string& output) const {
+        if (!names_) throw std::runtime_error("store has no name column");
+        names_->get_into(id, output);
+    }
+
+    void get_description_into(SequenceId id, std::string& output) const {
+        if (!descriptions_) throw std::runtime_error("store has no description column");
+        descriptions_->get_into(id, output);
     }
 
     // 组装只读资源视图，供批量与顺序读取模块借用 Store 持有的数据。
@@ -410,6 +423,7 @@ struct Store::Impl {
     Metadata metadata_;
     // 打开 Store 时确定的驻留模式，决定读取从文件、前缀还是全量内存取数据。
     StorageMode storage_mode_ = StorageMode::ByteRange;
+    IndexLoadMode index_load_mode_ = IndexLoadMode::Mmap;
     // 本对象拥有的 packed.bin 描述符；全量预加载后关闭并置为 -1。
     int packed_descriptor_ = -1;
     // 可选名称列读取器，列文件不存在时为空。
@@ -456,6 +470,10 @@ StorageMode Store::storage_mode() const noexcept {
     return impl_->storage_mode();
 }
 
+IndexLoadMode Store::index_load_mode() const noexcept {
+    return impl_->index_load_mode();
+}
+
 // 返回 packed 序列数据的常驻内存字节数。
 uint64_t Store::resident_bytes() const {
     return impl_->resident_bytes();
@@ -475,6 +493,15 @@ bool Store::has_names() const noexcept { return impl_->has_names(); }
 // 判断描述文本列是否存在。
 bool Store::has_descriptions() const noexcept {
     return impl_->has_descriptions();
+}
+
+// 单条文本读取直接复用字符串，避免批次规划和临时 arena。
+void Store::get_name_into(SequenceId id, std::string& output) const {
+    impl_->get_name_into(id, output);
+}
+
+void Store::get_description_into(SequenceId id, std::string& output) const {
+    impl_->get_description_into(id, output);
 }
 
 // 返回指定序列的 residue 长度。
