@@ -213,10 +213,6 @@ public:
     bool has_names() const noexcept;
     // 判断描述列是否存在。
     bool has_descriptions() const noexcept;
-    // 复用调用方字符串读取名称；并发调用须使用独立输出，不读取序列或描述。
-    void get_name_into(SequenceId id, std::string& output) const;
-    // 复用调用方字符串读取描述；并发调用须使用独立输出，不读取序列或名称。
-    void get_description_into(SequenceId id, std::string& output) const;
     // 校验 ID 后返回该序列的残基长度。
     uint64_t sequence_length(SequenceId id) const;
     // 返回当前运行时选择的解码内核名称。
@@ -258,7 +254,7 @@ public:
                                    SequenceId end_sequence,
                                    const std::vector<char*>& outputs,
                                    const ReadOptions& options = {}) const;
-    // 读取指定字段的记录批次，返回结果按输入 ID 顺序访问。
+    // 读取指定字段的记录批次，返回结果按输入 ID 顺序访问；单条也使用 {id}。
     RecordBatch batch_get_records(
         const std::vector<SequenceId>& ids,
         RecordFields fields = RecordFields::All,

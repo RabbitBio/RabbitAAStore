@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace aastore {
@@ -33,9 +32,6 @@ public:
     // 批量读取文本，结果按请求顺序访问，文本不追加 NUL。
     TextBatch batch_get(const std::vector<SequenceId>& ids,
                         const ReadOptions& options) const;
-    // 复用字符串读取一条文本；常驻正文直接复制，其余模式使用 pread。
-    // 并发调用须使用独立输出，空文本会清空输出。
-    void get_into(SequenceId id, std::string& output) const;
     // 返回常驻模式下的数据大小，不含元数据且不代表实时 RSS。
     uint64_t resident_bytes() const noexcept;
 

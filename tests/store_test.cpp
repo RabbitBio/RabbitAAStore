@@ -735,27 +735,18 @@ void StoreFixture::check_builder() {
                    sequence_only_path / "descriptions.meta") &&
                sequence_only_store.get(1).view(0) == expected[1],
            "sequence-only build omits both annotation columns");
-    bool annotation_rejected = false;
-    try {
-        (void)sequence_only_store.batch_get_records(
-            {1}, aastore::RecordFields::Name);
-    } catch (const std::runtime_error&) {
-        annotation_rejected = true;
-    }
-    expect(annotation_rejected,
-           "sequence-only stores report missing annotations on demand");
-    for (const bool name : {false, true}) {
-        std::string output = "unchanged";
+    for (const auto field : {aastore::RecordFields::Name,
+                            aastore::RecordFields::Description}) {
         bool rejected = false;
         try {
-            if (name) sequence_only_store.get_name_into(0, output);
-            else sequence_only_store.get_description_into(0, output);
+            (void)sequence_only_store.batch_get_records({0}, field);
         } catch (const std::runtime_error& error) {
             rejected = std::string(error.what()) ==
-                (name ? "store has no name column" : "store has no description column");
+                (field == aastore::RecordFields::Name
+                     ? "store has no name column" : "store has no description column");
         }
-        expect(rejected && output == "unchanged",
-               "single text reads reject absent columns without changing output");
+        expect(rejected,
+               "record batches reject absent text columns on demand");
     }
 
     const std::filesystem::path names_only_path =
@@ -1358,8 +1349,8 @@ void StoreFixture::check_sequential() {
 
 }
 
-// 用各线程独立缓冲覆盖重复请求、空描述及共享文件描述符的并发读取。
-void check_single_text_reads(const aastore::Store& store,
+// 用各线程独立批次覆盖单 ID 请求、空描述及共享文件描述符的并发读取。
+void check_text_record_reads(const aastore::Store& store,
                             const std::vector<std::string>& names,
                             const std::vector<std::string>& descriptions) {
     std::array<bool, 8> results{};
@@ -1367,12 +1358,19 @@ void check_single_text_reads(const aastore::Store& store,
     for (size_t worker = 0; worker < results.size(); ++worker) {
         workers.emplace_back([&, worker]() {
             try {
-                std::string name = "previous name", description = "previous description";
                 for (size_t i = 0; i < names.size() * 4; ++i) {
                     const size_t id = (names.size() - 1 - i % names.size() + worker) % names.size();
-                    store.get_name_into(id, name);
-                    store.get_description_into(id, description);
-                    if (name != names[id] || description != descriptions[id]) return;
+                    const auto name = store.batch_get_records({id}, aastore::RecordFields::Name);
+                    const auto description = store.batch_get_records(
+                        {id}, aastore::RecordFields::Description);
+                    if (name.name_view(0) != names[id] ||
+                        description.description_view(0) != descriptions[id]) return;
+                    for (const auto* record : {&name, &description}) {
+                        if (!record->sequences.empty() ||
+                            record->sequences.stats.requested_sequences != 0 ||
+                            record->sequences.stats.read_bytes != 0) return;
+                    }
+                    if (!name.descriptions.empty() || !description.names.empty()) return;
                 }
                 results[worker] = true;
             } catch (...) {}
@@ -1380,25 +1378,23 @@ void check_single_text_reads(const aastore::Store& store,
     }
     for (auto& worker : workers) worker.join();
     expect(all_true(results.data(), results.size()),
-           "single text reads preserve bytes, clear empty outputs and support concurrent callers");
-    for (const bool name : {false, true}) {
+           "single-ID record batches preserve text and empty entries, skip sequences and support concurrency");
+    for (const auto field : {aastore::RecordFields::Name,
+                            aastore::RecordFields::Description}) {
         for (const auto id : {store.size(), UINT64_MAX}) {
-            std::string output = "unchanged";
             bool rejected = false;
             try {
-                if (name) store.get_name_into(id, output);
-                else store.get_description_into(id, output);
+                (void)store.batch_get_records({id}, field);
             } catch (const std::out_of_range&) { rejected = true; }
-            expect(rejected && output == "unchanged",
-                   "single text reads reject invalid IDs without changing output");
+            expect(rejected, "text record batches reject invalid IDs");
         }
     }
 }
 
 // 覆盖紧凑文本索引的块末尾、下一块及最后一条记录。
-void check_single_text_boundaries(const std::filesystem::path& root) {
-    const auto input_path = root / "single_text_boundaries.fa";
-    const auto store_path = root / "single_text_boundaries";
+void check_text_record_boundaries(const std::filesystem::path& root) {
+    const auto input_path = root / "text_record_boundaries.fa";
+    const auto store_path = root / "text_record_boundaries";
     {
         std::ofstream input(input_path);
         for (size_t id = 0; id < 4098; ++id) {
@@ -1414,13 +1410,15 @@ void check_single_text_boundaries(const std::filesystem::path& root) {
             options.index_load_mode = index;
             options.resident_names = options.resident_descriptions = resident;
             aastore::Store store(store_path, options);
-            std::string name, description;
-            for (const aastore::SequenceId id : {4097, 4096, 4095, 1, 0, 4096}) {
-                store.get_name_into(id, name);
-                store.get_description_into(id, description);
-                expect(name == "n" + std::to_string(id) &&
-                           description == (id % 7 == 0 ? "" : std::string(100 + id % 33, 'd')),
-                       "single text reads cross compact-offset blocks in both index and body modes");
+            const std::vector<aastore::SequenceId> ids = {4097, 4096, 4095, 1, 0, 4096};
+            const auto records = store.batch_get_records(
+                ids, aastore::RecordFields::Name | aastore::RecordFields::Description);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const auto id = ids[i];
+                expect(records.name_view(i) == "n" + std::to_string(id) &&
+                           records.description_view(i) ==
+                               (id % 7 == 0 ? "" : std::string(100 + id % 33, 'd')),
+                       "text record batches cross compact-offset blocks in both index and body modes");
             }
         }
     }
@@ -1428,7 +1426,7 @@ void check_single_text_boundaries(const std::filesystem::path& root) {
 
 // 记录字段选择、文本列统计及未请求字段的访问错误。
 void StoreFixture::check_text() {
-    check_single_text_boundaries(temp.path());
+    check_text_record_boundaries(temp.path());
     aastore::Store store(store_path);
     auto full_options = full_store_options();
     full_options.index_load_mode = aastore::IndexLoadMode::Read;
@@ -1500,7 +1498,7 @@ void StoreFixture::check_text() {
                "resident text bytes count only enabled columns");
         expect(loaded.resident_bytes() == 0 && loaded.preload_ns() == 0,
                "text residency is independent of sequence preloading");
-        check_single_text_reads(loaded, expected_names, expected_descriptions);
+        check_text_record_reads(loaded, expected_names, expected_descriptions);
 
         for (const auto backend : {aastore::IoBackend::Pread, aastore::IoBackend::Auto}) {
             aastore::ReadOptions reading;
@@ -1532,6 +1530,26 @@ void StoreFixture::check_text() {
                     expect(plain_columns[column]->view(i) == measured_columns[column]->view(i),
                            "text diagnostics preserve content, order and duplicates");
                 }
+                for (const aastore::SequenceId id : {0, 1}) {
+                    const auto& text = column == 0 ? expected_names[id] : expected_descriptions[id];
+                    const auto field = column == 0 ? aastore::RecordFields::Name
+                                                   : aastore::RecordFields::Description;
+                    for (const bool diagnostics : {false, true}) {
+                        reading.collect_diagnostics = diagnostics;
+                        const auto single = loaded.batch_get_records({id}, field, reading);
+                        const auto& result = column == 0 ? single.names : single.descriptions;
+                        const auto& stats = result.stats;
+                        const auto read_bytes = stats.resident ? 0 : text.size();
+                        expect(result.view(0) == text && stats.resident == after.resident &&
+                                   stats.requested_strings == 1 && stats.requested_bytes == text.size() &&
+                                   stats.unique_bytes == (diagnostics ? text.size() : 0) &&
+                                   stats.read_bytes == read_bytes && stats.max_range_bytes == read_bytes &&
+                                   stats.ranges == (read_bytes == 0 ? 0 : 1) &&
+                                   stats.overread_bytes == 0 && stats.merged_gaps == 0 &&
+                                   (backend != aastore::IoBackend::Pread || !stats.io_uring),
+                               "single-field batches preserve content and I/O statistics, including empty text");
+                    }
+                }
             }
         }
 
@@ -1555,7 +1573,7 @@ void StoreFixture::check_text() {
         if (!opening.resident_descriptions) {
             for (auto& description : actual_descriptions) description.assign(description.size(), '#');
         }
-        check_single_text_reads(loaded, actual_names, actual_descriptions);
+        check_text_record_reads(loaded, actual_names, actual_descriptions);
         for (const auto backend : {aastore::IoBackend::Pread, aastore::IoBackend::Auto}) {
             aastore::ReadOptions reading;
             reading.io_backend = backend;

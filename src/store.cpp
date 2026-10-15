@@ -228,16 +228,6 @@ struct Store::Impl {
         return descriptions_ != nullptr;
     }
 
-    void get_name_into(SequenceId id, std::string& output) const {
-        if (!names_) throw std::runtime_error("store has no name column");
-        names_->get_into(id, output);
-    }
-
-    void get_description_into(SequenceId id, std::string& output) const {
-        if (!descriptions_) throw std::runtime_error("store has no description column");
-        descriptions_->get_into(id, output);
-    }
-
     // 组装只读资源视图，供批量与顺序读取模块借用 Store 持有的数据。
     StoreReadContext read_context() const noexcept {
         return StoreReadContext{
@@ -493,15 +483,6 @@ bool Store::has_names() const noexcept { return impl_->has_names(); }
 // 判断描述文本列是否存在。
 bool Store::has_descriptions() const noexcept {
     return impl_->has_descriptions();
-}
-
-// 单条文本读取直接复用字符串，避免批次规划和临时 arena。
-void Store::get_name_into(SequenceId id, std::string& output) const {
-    impl_->get_name_into(id, output);
-}
-
-void Store::get_description_into(SequenceId id, std::string& output) const {
-    impl_->get_description_into(id, output);
 }
 
 // 返回指定序列的 residue 长度。

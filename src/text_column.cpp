@@ -305,29 +305,6 @@ struct TextColumn::Impl {
         return block_base + offsets_[index];
     }
 
-    // 单条读取使用现有边界索引，不创建批次规划或临时 arena。
-    void get_into(SequenceId id, std::string& output) const {
-        if (id >= record_count_) {
-            throw std::out_of_range("text-column id out of range");
-        }
-        const uint64_t begin = offset(id), end = offset(id + 1);
-        if (end < begin || end > total_bytes_) {
-            throw std::runtime_error("invalid text-column boundaries");
-        }
-        const uint64_t bytes = end - begin;
-        if (bytes > static_cast<uint64_t>(output.max_size())) {
-            throw std::length_error("text record exceeds address space");
-        }
-        output.resize(static_cast<size_t>(bytes));
-        if (bytes == 0) return;
-        if (resident_) {
-            std::memcpy(output.data(), resident_data_.data() + begin,
-                        static_cast<size_t>(bytes));
-        } else {
-            pread_exact(descriptor_, output.data(), bytes, begin);
-        }
-    }
-
     // 按请求顺序建立输出布局，从常驻缓冲或合并读取范围填充文本批次。
     TextBatch batch_get(const std::vector<SequenceId>& ids,
                         const ReadOptions& options) const {
@@ -335,6 +312,39 @@ struct TextColumn::Impl {
         batch.offsets.resize(ids.size());
         batch.lengths.resize(ids.size());
         batch.stats.requested_strings = ids.size();
+        // 单条常驻文本或显式 pread 直接填充结果，不创建请求和范围规划。
+        if (ids.size() == 1 &&
+            (resident_ || options.io_backend == IoBackend::Pread)) {
+            if (ids[0] >= record_count_) {
+                throw std::out_of_range("text-column id out of range");
+            }
+            const uint64_t begin = offset(ids[0]), end = offset(ids[0] + 1);
+            if (end < begin || end > total_bytes_) {
+                throw std::runtime_error("invalid text-column boundaries");
+            }
+            const uint64_t bytes = end - begin;
+            if (bytes > static_cast<uint64_t>(
+                    std::numeric_limits<size_t>::max())) {
+                throw std::length_error("text batch exceeds address space");
+            }
+            batch.offsets[0] = 0;
+            batch.lengths[0] = bytes;
+            batch.storage.resize_uninitialized(static_cast<size_t>(bytes));
+            batch.stats.requested_bytes = bytes;
+            batch.stats.resident = resident_;
+            if (options.collect_diagnostics) batch.stats.unique_bytes = bytes;
+            if (bytes == 0) return batch;
+            if (resident_) {
+                std::memcpy(batch.storage.data(), resident_data_.data() + begin,
+                            static_cast<size_t>(bytes));
+            } else {
+                pread_exact(descriptor_, batch.storage.data(), bytes, begin);
+                batch.stats.ranges = 1;
+                batch.stats.read_bytes = bytes;
+                batch.stats.max_range_bytes = bytes;
+            }
+            return batch;
+        }
         std::vector<TextRequest> requests(ids.size());
         uint64_t output_bytes = 0;
         for (size_t i = 0; i < ids.size(); ++i) {
@@ -467,11 +477,6 @@ TextColumn::~TextColumn() = default;
 TextBatch TextColumn::batch_get(const std::vector<SequenceId>& ids,
                                 const ReadOptions& options) const {
     return impl_->batch_get(ids, options);
-}
-
-// 直接复制常驻文本或从数据文件读取一条记录。
-void TextColumn::get_into(SequenceId id, std::string& output) const {
-    impl_->get_into(id, output);
 }
 
 // 返回配置为常驻模式的文本数据大小，不含元数据。

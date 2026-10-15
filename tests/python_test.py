@@ -408,6 +408,12 @@ class PythonInterfaceTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 selected.description(0)
             names = store.batch_get_records([1], aastore.RecordFields.Name)
+            self.assertEqual(list(names), [dict(name=self.names[1])])
+            descriptions = store.batch_get_records([1], aastore.RecordFields.Description)
+            self.assertEqual(list(descriptions), [dict(description=self.descriptions[1])])
+            for text_only in (names, descriptions):
+                self.assertEqual(text_only.sequences.stats.requested_sequences, 0)
+                self.assertEqual(text_only.sequences.stats.read_bytes, 0)
             with self.assertRaises(RuntimeError):
                 names.sequence(0)
             self.assertEqual(list(store.batch_get_records([1], aastore.RecordFields.None_)), [{}])
