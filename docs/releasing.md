@@ -1,12 +1,16 @@
 # Versioning and release validation
 
-`VERSION` is the source of the CMake project version, Python package version,
-and Python extension version. Update it once when preparing a release, and
-record user-visible changes in `CHANGELOG.md`.
+This guide covers compatibility and release validation for RabbitAAStore.
+For installation and API examples, start with the
+[documentation index](README.md).
+
+[`VERSION`](../VERSION) is the single source for the CMake project version,
+Python package version, and Python extension version. Update it when preparing
+a release and record user-visible changes in the [changelog](../CHANGELOG.md).
 
 ## Compatibility
 
-AAStore's current support and validation scope is Linux x86_64 with 64-bit
+RabbitAAStore's current support and validation scope is Linux x86_64 with 64-bit
 pointers, little-endian byte order, glibc, and a GCC or Clang toolchain supporting
 C++17. This is an advisory support statement. Targets outside this scope remain
 unverified, with no compatibility guarantee. Scalar fallback and runtime SIMD
@@ -26,8 +30,8 @@ wheel support and validation range. Other Python implementations and special
 ABIs also remain unverified, with no compatibility guarantee. CI records the
 combinations actually checked within this support policy.
 
-Configure compiles and links a C++17 filesystem probe using the selected
-toolchain, without running it. It first tries the standard library alone,
+At configuration time, CMake compiles and links a C++17 filesystem probe using
+the selected toolchain, without running it. It first tries the standard library alone,
 then stdc++fs and c++fs. Any required companion library is propagated by the
 installed CMake target and pkg-config metadata, including Clang builds using
 older libstdc++ versions.
@@ -72,10 +76,23 @@ existing data remains readable and how to migrate it.
 
 ## Selecting tests and cross-compiling
 
-Normal builds register only the environment smoke checks. To compile the full
-suite, enter `tests/` and run `make`; executables go directly into `tests/`,
+Normal builds register only the environment smoke checks. The default
+standalone build runs them automatically using small temporary datasets. They
+cover construction, single- and multithreaded reads, residency modes, text
+columns, and backend selection. Python-enabled builds also check importing and
+using the extension. These checks need neither external datasets nor root
+access. An unavailable io_uring backend is explicitly reported as skipped;
+the automatic fallback path must still pass.
+
+Set `-DAASTORE_RUN_SMOKE_TESTS=OFF` to disable automatic post-build checks.
+They are disabled by default for embedded builds and cross-compilation.
+Building only `--target aastore` or building a Python wheel does not run them.
+To rerun registered smoke checks, use `(cd build && ctest -L smoke -V)`.
+
+To compile the full suite, enter `tests/` and run `make`; executables go directly into `tests/`,
 while intermediate files and the CMake cache stay in `tests/build/`.
-`make test` then runs all registered tests. Store tests have separate
+`make test` then runs all registered tests. See the
+[test README](../tests/README.md) for Makefile options. Store tests have separate
 `builder`, `random`, `sequential`, `text`, and `concurrency` labels; `options`
 covers configuration validation. The `compatibility` label covers legacy kernel
 and liburing paths through a private shim, plus CMake cross-compilation checks,

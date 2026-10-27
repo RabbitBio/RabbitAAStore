@@ -1,7 +1,12 @@
 # Changelog
 
+This file records user-visible changes to RabbitAAStore. Package and API names
+remain `aastore`.
+
 ## Unreleased
 
+- Rewrite the user guides and README files in English, add a documentation
+  index, and align examples and option descriptions with the current APIs.
 - Collect packed-byte coverage, overread, merge counts and prefix hit/miss
   residue counts only when `ReadOptions::collect_diagnostics` is enabled.
   Text coverage, overread and merge counts follow the same switch. Disabled
@@ -89,7 +94,7 @@
 
 ## 0.1.0 source baseline
 
-- Continuous AAPCMP3 5-bit sequence storage with compact boundary metadata.
+- Contiguous 5-bit sequence storage with AAPCMP3 compact boundary metadata.
 - Disk, fixed-prefix memory, and full-memory read modes; SIMD runtime dispatch.
 - Random batch reads, sequential reads, caller-provided buffers, and optional
   name and description columns.
