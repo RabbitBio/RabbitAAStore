@@ -302,7 +302,23 @@ struct TextColumn::Impl {
         std::memcpy(&block_base,
                     bases_ + (index >> block_shift_) * sizeof(uint64_t),
                     sizeof(block_base));
+        if (offsets_[index] > total_bytes_ ||
+            block_base > total_bytes_ - offsets_[index]) {
+            throw std::runtime_error("text-column boundary exceeds data size");
+        }
         return block_base + offsets_[index];
+    }
+
+    // 查询文本长度，包含空字符串并拒绝倒置边界。
+    uint64_t length(SequenceId id) const {
+        if (id >= record_count_) {
+            throw std::out_of_range("text-column id out of range");
+        }
+        const uint64_t begin = offset(id), end = offset(id + 1);
+        if (end < begin) {
+            throw std::runtime_error("text-column boundaries are not monotonic");
+        }
+        return end - begin;
     }
 
     // 按请求顺序建立输出布局，从常驻缓冲或合并读取范围填充文本批次。
@@ -477,6 +493,11 @@ TextColumn::~TextColumn() = default;
 TextBatch TextColumn::batch_get(const std::vector<SequenceId>& ids,
                                 const ReadOptions& options) const {
     return impl_->batch_get(ids, options);
+}
+
+// 从现有元数据查询一条记录的文本字节数。
+uint64_t TextColumn::length(SequenceId id) const {
+    return impl_->length(id);
 }
 
 // 返回配置为常驻模式的文本数据大小，不含元数据。

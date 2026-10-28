@@ -139,18 +139,21 @@ Sequence data, text data, and indexes have independent loading options.
 
 ### Sequence residency
 
-| `StorageMode` | Behavior |
-| --- | --- |
-| `ByteRange` (default) | Plan and read requested encoded byte ranges on demand; reads can use the operating system page cache. |
-| `PrefixMemory` | Preload up to `cache_bytes` of the encoded file at opening. Random requests entirely inside this fixed prefix decode from memory. |
-| `FullMemory` | Preload all encoded sequences into one buffer. Random batches bypass sorting, range planning, and sequence-file I/O. |
+Set `StoreOptions::preload_bytes` to an encoded-sequence preload budget. The
+store compares it with `packed_bytes()` at opening and selects the mode:
 
-For example, preload a 512 MiB sequence prefix and the complete name column:
+| `preload_bytes` | Reported `StorageMode` | Behavior |
+| --- | --- | --- |
+| `0` (default) | `NoMemory` | Plan and read requested encoded byte ranges on demand without preloading them. |
+| Positive, below `packed_bytes()` | `PartialMemory` | Preload a fixed prefix of exactly the budgeted bytes. Random requests entirely inside this prefix decode from memory. |
+| Positive, at least `packed_bytes()` | `FullMemory` | Preload all encoded sequences. Random batches bypass sorting, range planning, and sequence-file I/O. |
+
+For example, allow up to 512 MiB of sequence preloading and preload the complete
+name column:
 
 ```cpp
 aastore::StoreOptions options;
-options.storage_mode = aastore::StorageMode::PrefixMemory;
-options.cache_bytes = 512ULL * 1024 * 1024;
+options.preload_bytes = 512ULL * 1024 * 1024;
 options.threads = 4;
 options.resident_names = true;
 options.resident_descriptions = false;
@@ -158,12 +161,20 @@ aastore::Store store("proteins.aastore", options);
 std::cout << store.size() << " sequences, " << store.resident_bytes() << " packed bytes\n";
 ```
 
-`cache_bytes` applies only to `PrefixMemory` and must be positive in that mode.
-A budget larger than the encoded file loads only the available data. The
-prefix is fixed: there is no dynamic admission, eviction, or replacement.
-`FullMemory` needs no prefix budget. `StoreOptions::threads` defaults to `8`
-and limits sequence-preload workers, including the calling thread; `0` is
-treated as `1`.
+`store.storage_mode()` reports the selected mode; `StoreOptions` has no mode
+selector. A budget equal to or larger than the encoded data automatically uses
+`FullMemory` and allocates only `packed_bytes()` bytes. To request all encoded
+data without first checking its size, use `UINT64_MAX` as the budget. Zero selects
+`NoMemory` even for an empty database; a positive budget selects `FullMemory`
+when there are no encoded bytes.
+
+`preload_bytes` excludes indexes, resident text, decoded output, and I/O buffers.
+`NoMemory` means no explicit sequence preloading; it does not disable the
+operating system page cache or eliminate other memory use. A partial prefix is
+fixed: there is no dynamic admission, eviction, or replacement, and any positive
+budget is accepted without a minimum prefix size. `StoreOptions::threads`
+defaults to `8` and limits sequence-preload workers, including the calling
+thread; `0` is treated as `1`.
 
 ### Text residency
 
@@ -214,6 +225,8 @@ complete indexes. Neither mode locks pages in physical memory.
 | `get_into(id, string)` | Resize and reuse the caller's string; return `void`. |
 | `get_into(ids, outputs, options)` | Decode into caller-provided buffers; return `BatchStats`. |
 | `batch_get_records(ids, fields, options)` | A `RecordBatch` containing the selected fields in request order. |
+| `name_length(id)` | The stored name's byte count, queried from its index. |
+| `description_length(id)` | The stored description's byte count, queried from its index. |
 
 Single and random batch reads use the same `get()` interface:
 
@@ -287,6 +300,14 @@ that was not stored raises an exception.
 the corresponding `*_view()` methods borrow each column's batch storage.
 Column results and statistics are available as `names`, `descriptions`, and
 `sequences`. Name and description lengths are measured in bytes.
+
+Use `store.name_length(id)` and `store.description_length(id)` to obtain
+`uint64_t` byte counts before reading record fields, for example when planning
+a batch's memory budget. Both query the text indexes without reading text
+bodies or allocating an output string, regardless of text residency. They
+return zero for an empty field and count stored bytes, not Unicode characters.
+A missing column raises `std::runtime_error`; an ID outside `[0, store.size())`
+in a present column raises `std::out_of_range`.
 
 ## Read consecutive IDs
 
@@ -443,7 +464,7 @@ execute in a different order, but decoding places results at their original
 request positions. Fully resident random batches decode directly in parallel.
 
 Each io_uring worker owns a queue and decodes completed ranges while other
-requests remain outstanding. In `PrefixMemory`, those same workers interleave
+requests remain outstanding. In `PartialMemory`, those same workers interleave
 resident decoding with completion processing; there is no separate decoding
 pool. A fully resident batch needs no I/O queue. With `pread`, each worker
 synchronously reads and decodes its assigned ranges, and prefix hits are

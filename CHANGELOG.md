@@ -5,6 +5,20 @@ remain `aastore`.
 
 ## Unreleased
 
+- Add `Store::name_length(id)` and `description_length(id)`, also available in
+  Python, to query stored text byte counts from indexes without reading text
+  bodies. Empty fields return zero; missing columns and out-of-range IDs raise
+  exceptions. Existing databases need no conversion.
+- Replace `StoreOptions::cache_bytes` with `preload_bytes` and remove its
+  `storage_mode` selector in C++ and Python. The store now selects `NoMemory`
+  for zero, `PartialMemory` for a positive budget below the encoded sequence
+  size, and `FullMemory` when a positive budget covers all encoded bytes.
+  Rename the `StorageMode` values `ByteRange` and `PrefixMemory` to `NoMemory`
+  and `PartialMemory`; `store.storage_mode` remains a read-only result.
+  Update callers to supply only the preload budget and rebuild. Existing
+  databases need no conversion. Benchmark mode labels become `no_memory`,
+  `partial_memory`, and `full_memory`, and `prefix_budget_bytes` becomes
+  `preload_bytes`; existing memory command-line options remain supported.
 - Rewrite the user guides and README files in English, add a documentation
   index, and align examples and option descriptions with the current APIs.
 - Collect packed-byte coverage, overread, merge counts and prefix hit/miss
@@ -28,8 +42,8 @@ remain `aastore`.
   gap/size-based merging and sequential read APIs. Use `ranges` instead of
   the removed `sparse_ranges` and `scan_ranges` counters; rebuild callers.
 - Consolidate API migration notes: update callers and rebuild after removing
-  dynamic sequence-cache modes and their admission/eviction statistics; choose
-  ByteRange, PrefixMemory, or FullMemory instead. Existing AAPCMP3 databases
+  dynamic sequence-cache modes and their admission/eviction statistics; set
+  a fixed sequence preload budget instead. Existing AAPCMP3 databases
   do not need rebuilding for these API changes.
 - Replace read options `io_threads`, `io_uring_workers`, and `io_decode_threads`
   with the shared `threads` budget; rename the Store option `preload_threads`
@@ -39,8 +53,8 @@ remain `aastore`.
 - Remove the `sequential_get_into(..., Batch&, ...)` overload; use caller-owned
   output buffers with the pointer-array overload and consume the returned
   `BatchStats`.
-- Remove the benchmark's `--prefix-memory` switch; select a fixed packed prefix
-  with a positive `--memory-mb` or an exact `--memory-bytes` budget.
+- Remove the benchmark's `--prefix-memory` switch; set an encoded-sequence
+  preload budget with `--memory-mb` or `--memory-bytes`.
 - Consolidate engineering test fixtures in their runners and remove redundant
   probe cases and detailed toolchain snapshot checks while retaining legacy
   io_uring, linked dependency and installed SDK coverage.
@@ -59,7 +73,7 @@ remain `aastore`.
 - Detect baseline and optional liburing APIs at configure time so older
   READV-only libraries remain usable; check static SDK probe dependencies and
   liburing structure layouts before linking a consumer.
-- Centralize option validation and reject unknown storage modes and I/O backends
+- Centralize option validation and reject unknown index-loading modes and I/O backends
   before file access or output writes, including empty reads.
 - Expose optional `validate()` checks for C++ and Python configuration objects
   while preserving documented zero-valued read budgets and thread settings.

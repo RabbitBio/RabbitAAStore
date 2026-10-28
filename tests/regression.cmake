@@ -116,11 +116,9 @@ if(NOT CMAKE_CROSSCOMPILING AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
             "-DAASTORE_TEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/cross-consumer-$<CONFIG>"
             "-DAASTORE_TEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
             "-DAASTORE_TEST_CXX_FLAGS=${CMAKE_CXX_FLAGS}"
-            "-DAASTORE_TEST_CONFIG=$<CONFIG>"
             "-DAASTORE_TEST_GENERATOR=${CMAKE_GENERATOR}"
             "-DAASTORE_TEST_CTEST=${CMAKE_CTEST_COMMAND}"
             "-DAASTORE_TEST_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
-            "-DAASTORE_TEST_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/cross_consumer.cmake")
     set_tests_properties(aastore_cmake_cross_consumer PROPERTIES
         LABELS "compatibility;cmake;packaging")

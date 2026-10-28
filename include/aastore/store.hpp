@@ -178,7 +178,7 @@ private:
 
 class Store {
 public:
-    // 打开数据库，按存储和文本选项建立映射或预加载缓存。
+    // 打开数据库，按预载预算自动选择序列驻留模式，并应用索引和文本选项。
     explicit Store(const std::filesystem::path& path,
                    const StoreOptions& options = {});
     // 释放数据库文件、映射和缓存；调用方须先结束借用它们的读取操作。
@@ -199,7 +199,7 @@ public:
     uint64_t total_residues() const noexcept;
     // 返回 packed 数据的预期有效字节数。
     uint64_t packed_bytes() const noexcept;
-    // 返回当前配置的序列存储模式。
+    // 返回根据预载预算和编码序列大小自动选择的驻留模式。
     StorageMode storage_mode() const noexcept;
     // 返回序列及文本边界索引的加载方式，与正文存储模式独立。
     IndexLoadMode index_load_mode() const noexcept;
@@ -215,6 +215,10 @@ public:
     bool has_descriptions() const noexcept;
     // 校验 ID 后返回该序列的残基长度。
     uint64_t sequence_length(SequenceId id) const;
+    // 返回名称的字节数；缺少名称列或 ID 越界时抛出异常，不读取文本正文。
+    uint64_t name_length(SequenceId id) const;
+    // 返回描述的字节数；缺少描述列或 ID 越界时抛出异常，不读取文本正文。
+    uint64_t description_length(SequenceId id) const;
     // 返回当前运行时选择的解码内核名称。
     const char* decode_kernel_name() const noexcept;
     // 读取单条序列，返回含一个元素的批次；读取选项与多条读取一致。

@@ -140,9 +140,9 @@ object does not change a native call already in progress.
 Each class provides `validate()`. It returns `None` for valid settings and
 raises `ValueError` for invalid settings without changing the object.
 Public operations validate again, including empty requests and empty ranges.
-Unknown storage modes, index-loading modes, and I/O backends are rejected.
-Build threads must be positive, and `PrefixMemory` requires a positive
-`cache_bytes` budget.
+Unknown index-loading modes and I/O backends are rejected. Build threads must
+be positive. `preload_bytes` accepts integers from `0` through `2**64 - 1`;
+the binding rejects values outside this range.
 
 ### BuildOptions
 
@@ -171,23 +171,36 @@ cannot be constructed directly in Python.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `storage_mode` | `StorageMode.ByteRange` | Read sequence byte ranges on demand; alternatives are `PrefixMemory` and `FullMemory`. |
-| `cache_bytes` | `0` | Maximum encoded-prefix size in bytes for `PrefixMemory`. |
+| `preload_bytes` | `0` | Maximum encoded sequence bytes to preload; the store selects its residency mode automatically. |
 | `threads` | `8` | Thread budget for opening and preloading; zero is treated as one. |
 | `resident_names` | `False` | Preload the complete name column. |
 | `resident_descriptions` | `False` | Preload the complete description column. |
 | `index_load_mode` | `IndexLoadMode.Mmap` | Map indexes read-only; `Read` loads them completely into owned memory. |
 
-`PrefixMemory` loads a fixed prefix of the encoded sequence file. Sequences
-fully contained in that prefix are decoded from memory; other sequences are
-read from disk. The prefix is not replaced or evicted dynamically.
-`FullMemory` preloads all encoded sequence data. These modes retain encoded
-bytes, not decoded Python strings.
+The store compares `preload_bytes` with its encoded sequence size (`packed_bytes`)
+at opening. The resulting mode is exposed as the read-only `store.storage_mode`:
+
+| Budget | Reported `StorageMode` | Behavior |
+| --- | --- | --- |
+| `0` | `NoMemory` | No explicit sequence preloading; read requested bytes on demand. |
+| Positive, below `packed_bytes` | `PartialMemory` | Preload a fixed prefix of the budgeted size and read the rest on demand. |
+| Positive, at least `packed_bytes` | `FullMemory` | Preload all encoded bytes and use the full-memory read path. |
+
+The budget limits encoded sequence bytes, not total process memory. Indexes,
+text columns, decoded output, and I/O buffers are separate. `NoMemory` still
+allows operating system page caching. A partial prefix is not replaced or
+evicted dynamically, and there is no minimum positive budget. The resident data
+remains encoded, not decoded Python strings.
+
+A larger budget loads only `packed_bytes` bytes; use `preload_bytes=2**64 - 1`
+to request all encoded data without first querying its size. Zero selects
+`NoMemory` even for an empty database, while a positive budget selects
+`FullMemory` when there are no encoded bytes. `StoreOptions` no longer accepts
+`storage_mode` or `cache_bytes`; update callers to pass `preload_bytes`.
 
 ```python
 opening = aastore.StoreOptions(
-    storage_mode=aastore.StorageMode.PrefixMemory,
-    cache_bytes=64 * 1024 * 1024,
+    preload_bytes=64 * 1024 * 1024,
     threads=2,
     resident_names=True,
 )
@@ -257,7 +270,8 @@ reads = aastore.ReadOptions(threads=2, collect_diagnostics=True)
 
 `Store` supports context managers, `len(store)`, and integer indexing.
 `store[-1]` uses Python's negative-index convention. In contrast, sequence IDs
-passed to `get()`, `sequence_length()`, and batch methods must be nonnegative.
+passed to `get()`, `sequence_length()`, `name_length()`, `description_length()`,
+and batch methods must be nonnegative.
 
 `store[id]` uses the direct single-string path, decoding resident data from
 memory or reading nonresident data with `pread`. Use `store.get(id, reads)`
@@ -268,9 +282,21 @@ to select read options, including the I/O backend, for a single request.
 | `store.get(id, reads)` | `Batch` | One sequence, accessed with `batch[0]` or `batch.view(0)`. |
 | `store[id]` | `str` | A string copy of one sequence. |
 | `store.sequence_length(id)` | `int` | Sequence length, useful for allocating output buffers. |
+| `store.name_length(id)` | `int` | Stored name byte count, queried from its index without reading text. |
+| `store.description_length(id)` | `int` | Stored description byte count, queried from its index without reading text. |
 | `store.get(ids, reads)` | `Batch` | Arbitrary requests, preserving order and repeated IDs. |
 | `store.sequential_get(begin, end, reads)` | `Batch` | The half-open ID interval `[begin, end)`. |
 | `store.batch_get_records(ids, fields, reads)` | `RecordBatch` | Selected record fields in request order. |
+
+`name_length()` and `description_length()` can help budget a record batch before
+reading its fields. They query the text indexes without reading or decoding
+the text bodies, whether or not those bodies are resident in memory. Empty
+fields return zero. The result counts stored bytes, so it can differ from the
+number of characters in a decoded Python string. A missing column raises
+`RuntimeError`. For a present column, an ID representable as `uint64` but at
+least `len(store)` raises `IndexError`; negative IDs and values above
+`2**64 - 1` are rejected by the binding with `TypeError`. A closed store raises
+`ValueError`, as with `sequence_length()`.
 
 ### Batch and TextBatch
 

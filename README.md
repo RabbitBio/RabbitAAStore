@@ -176,13 +176,14 @@ for records, buffer views, and reusable output buffers are in
 
 ## Memory and I/O options
 
-Sequence residency is selected when opening a database:
+Set `StoreOptions.preload_bytes` to the maximum number of encoded sequence
+bytes to preload. The store selects its residency mode automatically at opening:
 
-| `StorageMode` | Behavior |
-| --- | --- |
-| `ByteRange` (default) | Read requested encoded sequences from disk on demand. |
-| `PrefixMemory` | Preload a fixed prefix of up to `cache_bytes` encoded bytes; read the rest on demand. |
-| `FullMemory` | Preload all encoded sequence data and decode it from memory. |
+| `preload_bytes` | Reported `StorageMode` | Behavior |
+| --- | --- | --- |
+| `0` (default) | `NoMemory` | Read requested encoded sequences on demand without preloading them. |
+| Positive, below `packed_bytes` | `PartialMemory` | Preload a fixed prefix of the encoded sequences; read the rest on demand. |
+| Positive, at least `packed_bytes` | `FullMemory` | Preload all encoded sequences and use the full-memory read path. |
 
 Names and descriptions have independent residency options. For example:
 
@@ -190,8 +191,7 @@ Names and descriptions have independent residency options. For example:
 import aastore
 
 opening = aastore.StoreOptions(
-    storage_mode=aastore.StorageMode.PrefixMemory,
-    cache_bytes=512 * 1024 * 1024,
+    preload_bytes=512 * 1024 * 1024,
     resident_names=True,
     resident_descriptions=True,
 )
@@ -199,12 +199,15 @@ reads = aastore.ReadOptions(threads=4)
 
 with aastore.Store("proteins.aastore", opening) as store:
     batch = store.get([2, 0, 2], reads)
-    print(store.resident_bytes, store.resident_text_bytes)
+    print(store.storage_mode, store.resident_bytes, store.resident_text_bytes)
 ```
 
-`cache_bytes` controls the encoded sequence prefix, not total process memory.
-Indexes, text columns, decoded output, and I/O buffers consume additional memory.
-The prefix remains fixed for the lifetime of the store.
+`preload_bytes` is a limit on encoded sequence preloading, not total process
+memory. The store loads at most `packed_bytes`, even with a larger budget.
+Indexes, text columns, decoded output, and I/O buffers consume additional memory;
+`NoMemory` can also use the operating system page cache. In `PartialMemory`, the
+prefix remains fixed for the lifetime of the store. The selected mode is available
+through the read-only `store.storage_mode` property; it is not an opening option.
 
 Index loading is independent of sequence residency. The default
 `IndexLoadMode.Mmap` maps sequence and text indexes read-only, allowing the

@@ -27,8 +27,8 @@ unavailable; `auto` permits fallback to `pread`.
 ## Individual runs
 
 The following commands use an existing database. Replace `proteins.aastore`
-with its path. These examples measure random requests, a 512 MiB resident
-prefix, full residency, and the consecutive-read interface:
+with its path. These examples measure random requests, a 512 MiB preload
+budget, full residency, and the consecutive-read interface:
 
 ```sh
 ./build/aastore_bench proteins.aastore \
@@ -71,8 +71,8 @@ process memory.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--memory-mb` | `0` | `0`: on-demand reads; positive: resident prefix in MiB; `-1`: full residency. |
-| `--memory-bytes` | Unset | Exact resident-prefix budget in bytes; zero selects on-demand reads. |
+| `--memory-mb` | `0` | Sequence preload budget in MiB; `0` disables preloading and `-1` requests full residency. |
+| `--memory-bytes` | Unset | Exact sequence preload budget in bytes; zero disables preloading. |
 | `--threads` | `8` | Internal worker budget for reads and initial sequence preloading. |
 | `--io-backend` | `auto` | `auto`, `pread`, or `uring`. |
 | `--queue-depth` | `64` | Target maximum outstanding requests per io_uring ring. |
@@ -81,10 +81,18 @@ process memory.
 | `--max-range` | `16384` | Maximum merged range size when bridging a nonzero gap. |
 | `--max-exact-range` | `1048576` | Maximum range size for overlapping or adjacent merges. |
 
-`--full-memory` is an alias for `--memory-mb -1`. `--memory-bytes` cannot be
-combined with `--memory-mb` or `--full-memory`. Prefix residency is fixed during
-a run; reads do not replace the resident region. Indexes use the library's
-default read-only mmap mode.
+`--full-memory` is an alias for `--memory-mb -1`; both pass `UINT64_MAX` as
+`StoreOptions::preload_bytes`. `--memory-bytes` cannot be combined with
+`--memory-mb` or `--full-memory`. All forms pass a budget to the library, which
+selects `NoMemory` for zero, `PartialMemory` for a positive budget below
+`packed_bytes`, and `FullMemory` when a positive budget covers all encoded data.
+Only the available encoded bytes are allocated when the budget is larger.
+A partial prefix is fixed during a run; reads do not replace the resident
+region. Indexes use the library's default read-only mmap mode.
+
+The budget covers encoded sequences only. It excludes indexes, text columns,
+decoded output, and I/O buffers. `NoMemory` means no explicit sequence preloading;
+it does not disable the operating system page cache.
 
 The caller issues batch reads serially, and RabbitAAStore distributes work
 internally. Full residency decodes directly from memory without disk range
@@ -135,6 +143,10 @@ Additional fields include:
 - `peak_rss_kib`: peak process RSS, including harness allocations; excludes
   unrelated system memory and the kernel's page cache.
 - `resident_bytes`: resident encoded sequence bytes, excluding metadata.
+- `preload_bytes`: requested encoded-sequence preload budget, which can exceed
+  the actual resident bytes.
+- `storage_mode`: automatically selected `no_memory`, `partial_memory`, or
+  `full_memory`.
 - `open_storage_read_bytes` and `fetch_storage_read_bytes`: Linux
   `/proc/self/io` device-read deltas, including attributable readahead. These
   differ from logical library `read_bytes` and whole-device counters.
@@ -161,8 +173,11 @@ python3 benchmarks/run_cold_matrix.py proteins.aastore results/cold-matrix \
 Use a new output directory. The runner adds a full-residency case to the
 requested prefix percentages. Prefix budgets are
 `floor(packed_bytes * percentage / 100)`: they represent encoded bytes, not
-record fractions or guaranteed hit rates. Zero selects `ByteRange`; a positive
-budget selects `PrefixMemory`. Full residency uses `FullMemory`.
+record fractions or guaranteed hit rates. Zero selects `NoMemory`; a positive
+budget below the encoded data size selects `PartialMemory`. A positive budget
+covering all encoded bytes selects `FullMemory`. For an empty encoded sequence
+file, a zero budget still selects `NoMemory`; the full-residency request uses a
+positive budget and reports `FullMemory`.
 
 Without explicit options, the runner uses sampling percentages `0.01` and `0.1`,
 thread counts `1`, `8`, and `64`, a zero-byte prefix plus full residency, one
