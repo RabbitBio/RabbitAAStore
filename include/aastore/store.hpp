@@ -1,4 +1,4 @@
-// 文件职责：定义 AAStore 的读取接口、结果批次和可复用输出缓冲。
+// 文件职责：定义 RabbitAAStore 的读取接口、结果批次和可复用输出缓冲。
 // Store 管理数据库资源，Batch、TextBatch 和 RecordBatch 提供结果访问及生命周期约定。
 #ifndef AASTORE_STORE_HPP
 #define AASTORE_STORE_HPP

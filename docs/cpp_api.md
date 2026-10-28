@@ -74,7 +74,7 @@ Alternatively, embed the source directly:
 
 ```cmake
 add_executable(my_app main.cpp)
-add_subdirectory(path/to/AABinaryStoreV2)
+add_subdirectory(path/to/RabbitAAStore)
 target_link_libraries(my_app PRIVATE aastore::aastore)
 ```
 

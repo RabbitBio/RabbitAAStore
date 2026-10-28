@@ -5,6 +5,8 @@ remain `aastore`.
 
 ## Unreleased
 
+- Use RabbitAAStore consistently as the project and display name. Keep the
+  `aastore` package, APIs, commands, build options, and database formats unchanged.
 - Add `Store::name_length(id)` and `description_length(id)`, also available in
   Python, to query stored text byte counts from indexes without reading text
   bodies. Empty fields return zero; missing columns and out-of-range IDs raise
@@ -48,7 +50,7 @@ remain `aastore`.
 - Replace read options `io_threads`, `io_uring_workers`, and `io_decode_threads`
   with the shared `threads` budget; rename the Store option `preload_threads`
   to `threads`. Remove `io_uring_max_bounded_workers` and its statistics;
-  AAStore does not configure or query kernel io-wq worker limits. Remove old
+  RabbitAAStore does not configure or query kernel io-wq worker limits. Remove old
   settings and remeasure CPU/I/O costs for highly concurrent workloads.
 - Remove the `sequential_get_into(..., Batch&, ...)` overload; use caller-owned
   output buffers with the pointer-array overload and consume the returned

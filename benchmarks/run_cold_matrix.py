@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # 文件职责：按抽样比例、线程数和前缀驻留比例运行独立进程冷缓存实验。
 # 保存实验配置、逐例日志和 CSV，并检查同组请求及输出校验值一致。
-"""Paired, fresh-process AAStore random-access pilot. Standard library only."""
+"""Paired, fresh-process RabbitAAStore random-access pilot. Standard library only."""
 
 import argparse
 import csv

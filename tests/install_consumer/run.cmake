@@ -9,7 +9,7 @@ function(aastore_test_cache_set path name value)
         string(FIND "${value}" "]${delimiter}]" closing)
     endwhile()
     file(APPEND "${path}"
-        "set(${name} [${delimiter}[${value}]${delimiter}] CACHE STRING \"AAStore SDK consumer test\" FORCE)\n")
+        "set(${name} [${delimiter}[${value}]${delimiter}] CACHE STRING \"RabbitAAStore SDK consumer test\" FORCE)\n")
 endfunction()
 
 function(aastore_write_consumer_toolchain_cache path)

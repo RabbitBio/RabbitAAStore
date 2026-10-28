@@ -498,9 +498,9 @@ void bind_store(py::module_& module) {
 
 }  // namespace
 
-// 初始化 Python 扩展；建库和读取仍由原生 AAStore 实现。
+// 初始化 Python 扩展；建库和读取仍由原生 RabbitAAStore 实现。
 PYBIND11_MODULE(_aastore, module) {
-    module.doc() = "AAStore C++ bindings for compact FASTA storage";
+    module.doc() = "RabbitAAStore C++ bindings for compact FASTA storage";
     module.attr("__version__") = AASTORE_PYTHON_VERSION;
     bind_options(module);
     bind_stats(module);

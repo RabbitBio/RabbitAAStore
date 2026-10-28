@@ -17,7 +17,7 @@ unverified, with no compatibility guarantee. Scalar fallback and runtime SIMD
 dispatch cover instruction-set differences within supported x86_64 CPUs.
 
 For new deployments, prefer a distribution-maintained LTS kernel based on
-Linux 6.1 or later. This is deployment guidance; AAStore has not established
+Linux 6.1 or later. This is deployment guidance; RabbitAAStore has not established
 a tested minimum kernel version. The pread backend does not require io_uring,
 and the Linux 5.4 READV compatibility path is retained. Consult the
 [kernel release information](https://www.kernel.org/category/releases.html)
@@ -64,7 +64,7 @@ The installed CMake package accepts compatible versions from that minor series.
 The shared-library SONAME includes both the major and minor version, so a new
 minor version does not silently replace the previous ABI.
 
-AAStore does not promise binary interchangeability across different C++
+RabbitAAStore does not promise binary interchangeability across different C++
 standard libraries, compiler ABIs, or build options. Rebuild applications when
 changing one of these. Changes to exposed option, statistics, or batch layouts
 must be reviewed as ABI changes even if the code still compiles.

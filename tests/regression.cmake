@@ -1,4 +1,4 @@
-# Full regression targets, included from the AAStore root CMakeLists.txt.
+# Full regression targets, included from the RabbitAAStore root CMakeLists.txt.
 if(AASTORE_BUILD_PYTHON AND NOT CMAKE_CROSSCOMPILING)
     add_test(NAME aastore_python_test
         COMMAND ${CMAKE_COMMAND} -E env
