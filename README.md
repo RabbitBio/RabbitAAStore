@@ -18,15 +18,20 @@ The Python package, C++ namespace, and command-line tools use the name `aastore`
 
 ## Installation
 
-The supported platform is Linux x86_64 with glibc and a C++17-capable GCC or Clang
-compiler. C++ builds require CMake 3.16 or later. The portable-wheel configuration
-targets standard CPython 3.9–3.13; source builds require Python 3.9 or later.
-See the [compatibility guide](docs/releasing.md#compatibility) for platform and
-kernel/backend details.
+### Bioconda
 
-### C++ library and command-line tool
+RabbitAAStore is available on [Bioconda](https://anaconda.org/bioconda/aastore)
+as `aastore` for Linux x86-64 with Python 3.10–3.13.
 
-Run from the repository root:
+```bash
+conda create -n rabbitaastore -c conda-forge -c bioconda --strict-channel-priority python=3.12 aastore
+```
+
+### C++ library and command-line tool from source
+
+Building on Linux x86-64 with glibc requires a C++17-capable GCC or Clang
+compiler and CMake 3.16 or later. See the [compatibility guide](docs/releasing.md#compatibility)
+for platform and I/O backend details. Run the following commands from the repository root.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -54,16 +59,17 @@ imported target supplies the include paths, C++ standard, and link dependencies.
 The [C++ guide](docs/cpp_api.md) also covers shared-library builds and embedding
 with `add_subdirectory`.
 
-### Python package
+### Python package from source
 
-Install from the repository root:
+Building the Python package requires Python 3.9 or later, Python development
+headers, and a C++17 compiler. The portable-wheel configuration targets standard
+CPython 3.9–3.13. Install from the repository root with the following command.
 
 ```bash
 python -m pip install .
 ```
 
-A C++17 compiler and Python development headers are required; pip installs the
-Python build dependencies in an isolated environment. NumPy is optional.
+pip installs the Python build dependencies in an isolated environment. NumPy is optional.
 
 Python builds use `pread` by default. To enable the optional `io_uring` backend,
 install the liburing development package for your system and run:
